@@ -21,7 +21,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use crate::config::{self, Config};
 use crate::snow::{FlakeSize, Intensity, Snow, Weather, Wind};
-use crate::{autostart, render::Renderer};
+use crate::{autostart, render::Renderer, scan};
 
 const WM_TRAY: u32 = WM_APP + 1;
 const HOTKEY_PAUSE: i32 = 1;
@@ -39,6 +39,10 @@ const ID_EXIT: u32 = 160;
 
 struct App {
     overlay: HWND,
+    tray: HWND,
+    /// Overlay top-left in screen coordinates.
+    origin: (i32, i32),
+    last_scan: Instant,
     renderer: Option<Renderer>,
     snow: Snow,
     cfg: Config,
@@ -168,13 +172,16 @@ pub fn run() {
 
         let cfg = config::load();
         autostart::refresh();
-        let renderer = Renderer::new(overlay, w as u32, h as u32).ok();
+        let renderer = Renderer::new(overlay, w as u32, h as u32, dpi_scale()).ok();
         let snow = Snow::new(w as f32, h as f32, dpi_scale(), cfg.weather, seed());
         let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
 
         APP.with(|a| {
             *a.borrow_mut() = Some(App {
                 overlay,
+                tray,
+                origin: (x, y),
+                last_scan: Instant::now() - Duration::from_secs(1),
                 renderer,
                 snow,
                 cfg,
@@ -242,15 +249,28 @@ fn frame() {
         let now = Instant::now();
         let dt = (now - a.last).as_secs_f32();
         a.last = now;
+
+        // 20 scans a second: often enough to catch a window being flung.
+        if now - a.last_scan >= Duration::from_millis(50) {
+            let interval = (now - a.last_scan).as_secs_f32().min(0.5);
+            a.last_scan = now;
+            let ledges = scan::ledges(&[a.overlay, a.tray], a.origin, dpi_scale());
+            a.snow.set_ledges(&ledges, interval);
+        }
+        let mut pt = POINT::default();
+        let cursor = unsafe { GetCursorPos(&mut pt) }
+            .ok()
+            .map(|_| ((pt.x - a.origin.0) as f32, (pt.y - a.origin.1) as f32));
+        a.snow.set_cursor(cursor, dt);
         a.snow.step(dt);
 
         if a.renderer.is_none() && now - a.last_device_try > Duration::from_secs(2) {
             a.last_device_try = now;
             let (_, _, w, h) = virtual_screen();
-            a.renderer = Renderer::new(a.overlay, w as u32, h as u32).ok();
+            a.renderer = Renderer::new(a.overlay, w as u32, h as u32, dpi_scale()).ok();
         }
         if let Some(r) = a.renderer.as_mut() {
-            if r.draw(&a.snow.flakes).is_err() {
+            if r.draw(&a.snow).is_err() {
                 // GPU reset or driver update: rebuild on a later frame.
                 a.renderer = None;
                 a.last_device_try = now;
@@ -351,6 +371,7 @@ fn set_weather(f: impl FnOnce(&mut Weather)) {
 fn on_display_change() {
     with_app(|a| {
         let (x, y, w, h) = virtual_screen();
+        a.origin = (x, y);
         unsafe {
             let _ = SetWindowPos(a.overlay, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
         }

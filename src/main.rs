@@ -1,6 +1,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
+mod art;
 mod config;
+mod pile;
 mod snow;
 
 #[cfg(windows)]
@@ -9,6 +11,8 @@ mod app;
 mod autostart;
 #[cfg(windows)]
 mod render;
+#[cfg(windows)]
+mod scan;
 
 #[cfg(windows)]
 fn main() {

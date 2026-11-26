@@ -1,19 +1,26 @@
 //! GPU renderer: a premultiplied-alpha DirectComposition swap chain covering the
-//! overlay window, drawn with one Direct2D sprite batch per frame.
+//! overlay window. Flakes and clumps are drawn from a procedurally generated
+//! texture atlas with one Direct2D sprite batch (each sprite rotated and
+//! squashed by its tumble); piles are shaded vector shapes with a soft shadow,
+//! a bright crest and twinkling glints.
 
 use std::mem::ManuallyDrop;
 
 use windows::core::{Interface, Result};
+use windows::Foundation::Numerics::Matrix3x2;
 use windows::Win32::Foundation::{HMODULE, HWND};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_PIXEL_FORMAT, D2D_RECT_F, D2D_SIZE_U,
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_BEGIN_HOLLOW,
+    D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_GRADIENT_STOP, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
+    D2D_RECT_U, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
-    D2D1CreateFactory, ID2D1Bitmap1, ID2D1DeviceContext3, ID2D1Factory1, ID2D1SpriteBatch,
-    D2D1_ANTIALIAS_MODE_ALIASED, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
-    D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1,
-    D2D1_DEVICE_CONTEXT_OPTIONS_NONE, D2D1_FACTORY_OPTIONS, D2D1_FACTORY_TYPE_SINGLE_THREADED,
-    D2D1_SPRITE_OPTIONS_NONE,
+    D2D1CreateFactory, ID2D1Bitmap1, ID2D1DeviceContext3, ID2D1Factory1, ID2D1LinearGradientBrush,
+    ID2D1PathGeometry1, ID2D1RenderTarget, ID2D1SolidColorBrush, ID2D1SpriteBatch, D2D1_ANTIALIAS_MODE_ALIASED,
+    D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
+    D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
+    D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_OPTIONS, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
+    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_SPRITE_OPTIONS_NONE,
 };
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
@@ -22,29 +29,36 @@ use windows::Win32::Graphics::Direct3D11::{
 use windows::Win32::Graphics::DirectComposition::{
     DCompositionCreateDevice, IDCompositionDevice, IDCompositionTarget, IDCompositionVisual,
 };
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC,
-};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_ALPHA_MODE_PREMULTIPLIED, DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory2, IDXGIDevice, IDXGIFactory2, IDXGISurface, IDXGISwapChain1,
-    DXGI_CREATE_FACTORY_FLAGS, DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1,
-    DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL, DXGI_USAGE_RENDER_TARGET_OUTPUT,
+    CreateDXGIFactory2, IDXGIDevice, IDXGIFactory2, IDXGISurface, IDXGISwapChain1, DXGI_CREATE_FACTORY_FLAGS,
+    DXGI_PRESENT, DXGI_SCALING_STRETCH, DXGI_SWAP_CHAIN_DESC1, DXGI_SWAP_CHAIN_FLAG, DXGI_SWAP_EFFECT_FLIP_SEQUENTIAL,
+    DXGI_USAGE_RENDER_TARGET_OUTPUT,
 };
 
-use crate::snow::Flake;
+use crate::art::{self, sprite};
+use crate::pile::Pile;
+use crate::snow::Snow;
 
-/// Side of the square flake sprite texture, in pixels.
-const SPRITE: u32 = 64;
-/// The sprite's white core fills this fraction of its radius; the rest is a soft shadow.
-const CORE: f32 = 0.6;
+/// Flakes nearer than this are drawn in front of the piles; farther ones behind.
+const FRONT_DEPTH: f32 = 0.5;
 
 pub struct Renderer {
     swap: IDXGISwapChain1,
+    factory: ID2D1Factory1,
     dc: ID2D1DeviceContext3,
-    sprite: ID2D1Bitmap1,
+    atlas: ID2D1Bitmap1,
     batch: ID2D1SpriteBatch,
+    snow_fill: ID2D1LinearGradientBrush,
+    edge_brush: ID2D1SolidColorBrush,
+    crest_brush: ID2D1SolidColorBrush,
+    shadow_brush: ID2D1SolidColorBrush,
+    /// Physical pixels per logical pixel, for line widths and offsets.
+    scale: f32,
     rects: Vec<D2D_RECT_F>,
+    srcs: Vec<D2D_RECT_U>,
     colors: Vec<D2D1_COLOR_F>,
+    xforms: Vec<Matrix3x2>,
     // Kept alive for as long as the window shows the swap chain.
     _d3d: ID3D11Device,
     _dcomp: IDCompositionDevice,
@@ -70,38 +84,28 @@ fn create_device(kind: D3D_DRIVER_TYPE) -> Result<ID3D11Device> {
     Ok(device.expect("D3D11CreateDevice returned no device"))
 }
 
-/// Premultiplied BGRA pixels of a round snowflake: a white core with a soft
-/// edge, wrapped in a faint slate-coloured shadow so it still reads on white windows.
-fn sprite_pixels() -> Vec<u8> {
-    let n = SPRITE as usize;
-    let mut px = vec![0u8; n * n * 4];
-    let c = (n as f32 - 1.0) / 2.0;
-    let edge = 3.0 / n as f32;
-    for y in 0..n {
-        for x in 0..n {
-            let d = (((x as f32 - c).powi(2) + (y as f32 - c).powi(2)).sqrt()) / (n as f32 / 2.0);
-            let core = ((CORE + edge - d) / (2.0 * edge)).clamp(0.0, 1.0);
-            let t = ((d - CORE) / (1.0 - CORE)).clamp(0.0, 1.0);
-            let shadow = if d < 1.0 { 0.32 * (1.0 - t).powf(1.8) } else { 0.0 };
-            // Composite the core over the shadow (both premultiplied).
-            let (cr, cg, cb) = (0.97, 0.98, 1.0);
-            let (sr, sg, sb) = (0.30, 0.36, 0.46);
-            let a = core + shadow * (1.0 - core);
-            let r = cr * core + sr * shadow * (1.0 - core);
-            let g = cg * core + sg * shadow * (1.0 - core);
-            let b = cb * core + sb * shadow * (1.0 - core);
-            let i = (y * n + x) * 4;
-            px[i] = (b * 255.0).round() as u8;
-            px[i + 1] = (g * 255.0).round() as u8;
-            px[i + 2] = (r * 255.0).round() as u8;
-            px[i + 3] = (a * 255.0).round() as u8;
-        }
-    }
-    px
+fn color(r: f32, g: f32, b: f32, a: f32) -> D2D1_COLOR_F {
+    D2D1_COLOR_F { r, g, b, a }
+}
+
+fn identity() -> Matrix3x2 {
+    Matrix3x2 { M11: 1.0, M12: 0.0, M21: 0.0, M22: 1.0, M31: 0.0, M32: 0.0 }
+}
+
+fn translate(x: f32, y: f32) -> Matrix3x2 {
+    Matrix3x2 { M31: x, M32: y, ..identity() }
+}
+
+/// Cheap integer hash for stable per-cell randomness (glint placement).
+fn hash(a: u64, b: u64) -> u64 {
+    let mut x = a.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ b.wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+    x ^= x >> 31;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 29)
 }
 
 impl Renderer {
-    pub fn new(hwnd: HWND, width: u32, height: u32) -> Result<Self> {
+    pub fn new(hwnd: HWND, width: u32, height: u32, scale: f32) -> Result<Self> {
         unsafe {
             let d3d = create_device(D3D_DRIVER_TYPE_HARDWARE).or_else(|_| create_device(D3D_DRIVER_TYPE_WARP))?;
             let dxgi: IDXGIDevice = d3d.cast()?;
@@ -132,32 +136,58 @@ impl Renderer {
             target.SetRoot(&visual)?;
             dcomp.Commit()?;
 
-            let pixels = sprite_pixels();
+            let pixels = art::atlas_bgra();
             let props = D2D1_BITMAP_PROPERTIES1 {
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                },
+                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
                 dpiX: 96.0,
                 dpiY: 96.0,
                 bitmapOptions: D2D1_BITMAP_OPTIONS_NONE,
                 colorContext: ManuallyDrop::new(None),
             };
-            let sprite = dc.CreateBitmap(
-                D2D_SIZE_U { width: SPRITE, height: SPRITE },
+            let atlas = dc.CreateBitmap(
+                D2D_SIZE_U { width: art::WIDTH, height: art::HEIGHT },
                 Some(pixels.as_ptr() as *const _),
-                SPRITE * 4,
+                art::WIDTH * 4,
                 &props,
             )?;
             let batch = dc.CreateSpriteBatch()?;
 
+            // Snow is bright on top and picks up a cool blue shade toward its base.
+            let stops = [
+                D2D1_GRADIENT_STOP { position: 0.0, color: color(1.0, 1.0, 1.0, 1.0) },
+                D2D1_GRADIENT_STOP { position: 0.45, color: color(0.95, 0.97, 1.0, 1.0) },
+                D2D1_GRADIENT_STOP { position: 1.0, color: color(0.77, 0.84, 0.94, 1.0) },
+            ];
+            // The simple overload lives on ID2D1RenderTarget; the device context shadows it.
+            let rt: ID2D1RenderTarget = dc.cast()?;
+            let stops = rt.CreateGradientStopCollection(&stops, D2D1_GAMMA_2_2, D2D1_EXTEND_MODE_CLAMP)?;
+            let snow_fill = dc.CreateLinearGradientBrush(
+                &D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES {
+                    startPoint: D2D_POINT_2F { x: 0.0, y: 0.0 },
+                    endPoint: D2D_POINT_2F { x: 0.0, y: 10.0 },
+                },
+                None,
+                &stops,
+            )?;
+            let edge_brush = dc.CreateSolidColorBrush(&color(0.55, 0.62, 0.74, 0.7), None)?;
+            let crest_brush = dc.CreateSolidColorBrush(&color(1.0, 1.0, 1.0, 0.95), None)?;
+            let shadow_brush = dc.CreateSolidColorBrush(&color(0.08, 0.12, 0.2, 0.22), None)?;
+
             let r = Self {
                 swap,
+                factory: d2f,
                 dc,
-                sprite,
+                atlas,
                 batch,
+                snow_fill,
+                edge_brush,
+                crest_brush,
+                shadow_brush,
+                scale,
                 rects: Vec::new(),
+                srcs: Vec::new(),
                 colors: Vec::new(),
+                xforms: Vec::new(),
                 _d3d: d3d,
                 _dcomp: dcomp,
                 _target: target,
@@ -172,10 +202,7 @@ impl Renderer {
         unsafe {
             let surface: IDXGISurface = self.swap.GetBuffer(0)?;
             let props = D2D1_BITMAP_PROPERTIES1 {
-                pixelFormat: D2D1_PIXEL_FORMAT {
-                    format: DXGI_FORMAT_B8G8R8A8_UNORM,
-                    alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED,
-                },
+                pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
                 dpiX: 96.0,
                 dpiY: 96.0,
                 bitmapOptions: D2D1_BITMAP_OPTIONS_TARGET | D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
@@ -195,47 +222,180 @@ impl Renderer {
         self.bind_target()
     }
 
+    /// Queue one sprite: centred at (x, y), body radius `r`, rotated by `angle`,
+    /// squashed across by `squash` (tumbling), with opacity `alpha`.
+    fn push(&mut self, id: u16, x: f32, y: f32, r: f32, angle: f32, squash: f32, alpha: f32) {
+        let half = r / art::body_fraction(id);
+        self.rects.push(D2D_RECT_F { left: -half, top: -half, right: half, bottom: half });
+        let (x0, y0, x1, y1) = art::cell_rect(id);
+        self.srcs.push(D2D_RECT_U { left: x0, top: y0, right: x1, bottom: y1 });
+        // Premultiplied tint: scales the whole sprite by `alpha`.
+        self.colors.push(color(alpha, alpha, alpha, alpha));
+        let (s, c) = angle.sin_cos();
+        // Row-vector convention: squash along local x, then rotate, then move.
+        self.xforms.push(Matrix3x2 { M11: squash * c, M12: squash * s, M21: -s, M22: c, M31: x, M32: y });
+    }
+
+    /// Build the fill and crest geometry for one pile's visible parts.
+    fn pile_geometry(&self, p: &Pile) -> Result<Option<(ID2D1PathGeometry1, ID2D1PathGeometry1)>> {
+        unsafe {
+            let fill = self.factory.CreatePathGeometry()?;
+            let crest = self.factory.CreatePathGeometry()?;
+            let fs = fill.Open()?;
+            let cs = crest.Open()?;
+            let mut any = false;
+            let mut pts: Vec<D2D_POINT_2F> = Vec::new();
+            for &(a, b) in &p.visible {
+                let (Some(i0), Some(i1)) = (p.cell_at(a), p.cell_at((b - 0.01).max(a))) else { continue };
+                if p.h[i0..=i1].iter().all(|&h| h < 0.4) {
+                    continue;
+                }
+                pts.clear();
+                pts.push(D2D_POINT_2F { x: a, y: p.y - p.h[i0] });
+                for i in i0..=i1 {
+                    pts.push(D2D_POINT_2F { x: p.cell_x(i).clamp(a, b), y: p.y - p.h[i] });
+                }
+                pts.push(D2D_POINT_2F { x: b, y: p.y - p.h[i1] });
+
+                fs.BeginFigure(D2D_POINT_2F { x: a, y: p.y + 0.5 }, D2D1_FIGURE_BEGIN_FILLED);
+                fs.AddLines(&pts);
+                fs.AddLine(D2D_POINT_2F { x: b, y: p.y + 0.5 });
+                fs.EndFigure(D2D1_FIGURE_END_CLOSED);
+
+                cs.BeginFigure(pts[0], D2D1_FIGURE_BEGIN_HOLLOW);
+                cs.AddLines(&pts[1..]);
+                cs.EndFigure(D2D1_FIGURE_END_OPEN);
+                any = true;
+            }
+            fs.Close()?;
+            cs.Close()?;
+            Ok(any.then_some((fill, crest)))
+        }
+    }
+
+    /// Shadow, outline, shaded body and bright crest for every pile.
+    fn draw_piles(&self, piles: &[Pile]) -> Result<()> {
+        let s = self.scale;
+        unsafe {
+            self.dc.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+            for p in piles {
+                let Some((fill, crest)) = self.pile_geometry(p)? else { continue };
+                // Soft contact shadow on the window just below and right of the snow.
+                self.dc.SetTransform(&translate(0.8 * s, 1.6 * s));
+                self.dc.FillGeometry(&fill, &self.shadow_brush, None);
+                self.dc.SetTransform(&identity());
+                // Thin cool outline so white snow reads against white title bars.
+                self.dc.DrawGeometry(&crest, &self.edge_brush, 1.6 * s, None);
+                self.snow_fill.SetStartPoint(D2D_POINT_2F { x: 0.0, y: p.y - p.max_h });
+                self.snow_fill.SetEndPoint(D2D_POINT_2F { x: 0.0, y: p.y });
+                self.dc.FillGeometry(&fill, &self.snow_fill, None);
+                // Sunlit crest just inside the top surface.
+                self.dc.SetTransform(&translate(0.0, 0.9 * s));
+                self.dc.DrawGeometry(&crest, &self.crest_brush, 1.1 * s, None);
+                self.dc.SetTransform(&identity());
+            }
+        }
+        Ok(())
+    }
+
     /// Draw one frame and queue it for display. An error means the GPU device
     /// was lost; the caller should drop this renderer and build a new one.
-    pub fn draw(&mut self, flakes: &[Flake]) -> Result<()> {
+    pub fn draw(&mut self, snow: &Snow) -> Result<()> {
+        let s = self.scale;
         self.rects.clear();
+        self.srcs.clear();
         self.colors.clear();
-        for f in flakes {
-            // The sprite's core is CORE of its radius, so scale the quad up to match.
-            let r = f.r / CORE;
-            self.rects.push(D2D_RECT_F { left: f.x - r, top: f.y - r, right: f.x + r, bottom: f.y + r });
-            let a = f.alpha;
-            // Premultiplied tint: scales the whole sprite by `a`.
-            self.colors.push(D2D1_COLOR_F { r: a, g: a, b: a, a });
+        self.xforms.clear();
+
+        // Back layer: far flakes, behind the piles.
+        for f in snow.flakes.iter().filter(|f| f.depth < FRONT_DEPTH) {
+            self.push(f.sprite, f.x, f.y, f.r, f.angle, f.squash, f.alpha);
         }
+        let back = self.rects.len() as u32;
+        // Front layer: near flakes, flying clumps and powder.
+        for f in snow.flakes.iter().filter(|f| f.depth >= FRONT_DEPTH) {
+            self.push(f.sprite, f.x, f.y, f.r, f.angle, f.squash, f.alpha);
+        }
+        // Lumpy surface texture: soft snow lumps half-sunk into each pile's crest.
+        for p in &snow.piles {
+            for i in 0..p.h.len() {
+                let hv = hash(p.id ^ 0x5EED, i as u64);
+                if hv % 5 != 0 || p.h[i] < 2.5 * s {
+                    continue;
+                }
+                let x = p.cell_x(i);
+                if !p.is_visible(x) {
+                    continue;
+                }
+                let grow = (p.h[i] / (0.5 * p.max_h)).min(1.0);
+                let r = (1.8 + 2.6 * ((hv >> 20) & 0xFF) as f32 / 255.0) * s * grow;
+                let id = sprite::LUMP[((hv >> 8) % 8) as usize];
+                let angle = ((hv >> 40) & 0xFFFF) as f32 / 65535.0 * 6.283;
+                self.push(id, x, p.y - p.h[i] + r * 0.55, r, angle, 1.0, 1.0);
+            }
+        }
+        for p in &snow.puffs {
+            self.push(p.sprite, p.x, p.y, p.r, p.angle, 1.0, p.alpha.min(1.0));
+        }
+        // Glints: a few fixed spots on each pile catch the light now and then.
+        for p in &snow.piles {
+            for i in 0..p.h.len() {
+                let hv = hash(p.id, i as u64);
+                if hv % 29 != 0 || p.h[i] < 2.5 * s {
+                    continue;
+                }
+                let x = p.cell_x(i);
+                if !p.is_visible(x) {
+                    continue;
+                }
+                let rate = 0.6 + (hv >> 8 & 0xFF) as f32 / 255.0 * 1.4;
+                let phase = (hv >> 16 & 0xFFFF) as f32 / 65535.0 * 6.283;
+                let tw = (snow.time * rate + phase).sin().max(0.0).powi(24);
+                if tw > 0.03 {
+                    let y = p.y - p.h[i] + ((hv >> 32 & 0xFF) as f32 / 255.0) * p.h[i] * 0.5;
+                    self.push(sprite::GLINT, x, y, 2.6 * s * (0.6 + 0.4 * tw), snow.time * 0.3, 1.0, tw);
+                }
+            }
+        }
+
         unsafe {
             self.dc.BeginDraw();
-            self.dc.Clear(Some(&D2D1_COLOR_F { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }));
-            if !self.rects.is_empty() {
-                // Sprite batches require aliased mode; the sprite itself is antialiased.
-                self.dc.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+            self.dc.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
+            let n = self.rects.len() as u32;
+            if n > 0 {
                 self.batch.Clear();
+                let tstride = std::mem::size_of::<Matrix3x2>() as u32;
                 self.batch.AddSprites(
-                    self.rects.len() as u32,
+                    n,
                     self.rects.as_ptr(),
-                    None,
+                    Some(self.srcs.as_ptr()),
                     Some(self.colors.as_ptr()),
-                    None,
+                    Some(self.xforms.as_ptr()),
                     std::mem::size_of::<D2D_RECT_F>() as u32,
-                    0,
+                    std::mem::size_of::<D2D_RECT_U>() as u32,
                     std::mem::size_of::<D2D1_COLOR_F>() as u32,
-                    0,
+                    tstride,
                 )?;
+            }
+            // Sprite batches require aliased mode; the sprites themselves are antialiased.
+            if back > 0 {
+                self.dc.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
+                self.dc.DrawSpriteBatch(&self.batch, 0, back, &self.atlas, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_SPRITE_OPTIONS_NONE);
+            }
+            let piles = self.draw_piles(&snow.piles);
+            if n > back {
+                self.dc.SetAntialiasMode(D2D1_ANTIALIAS_MODE_ALIASED);
                 self.dc.DrawSpriteBatch(
                     &self.batch,
-                    0,
-                    self.rects.len() as u32,
-                    &self.sprite,
+                    back,
+                    n - back,
+                    &self.atlas,
                     D2D1_BITMAP_INTERPOLATION_MODE_LINEAR,
                     D2D1_SPRITE_OPTIONS_NONE,
                 );
             }
             self.dc.EndDraw(None, None)?;
+            piles?;
             self.swap.Present(1, DXGI_PRESENT(0)).ok()?;
         }
         Ok(())
@@ -243,6 +403,11 @@ impl Renderer {
 
     /// Show nothing (used right before hiding the overlay).
     pub fn clear(&mut self) -> Result<()> {
-        self.draw(&[])
+        unsafe {
+            self.dc.BeginDraw();
+            self.dc.Clear(Some(&color(0.0, 0.0, 0.0, 0.0)));
+            self.dc.EndDraw(None, None)?;
+            self.swap.Present(0, DXGI_PRESENT(0)).ok()
+        }
     }
 }

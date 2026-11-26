@@ -245,25 +245,23 @@ impl Renderer {
             let cs = crest.Open()?;
             let mut any = false;
             let mut pts: Vec<D2D_POINT_2F> = Vec::new();
-            for &(a, b) in &p.visible {
-                let (Some(i0), Some(i1)) = (p.cell_at(a), p.cell_at((b - 0.01).max(a))) else { continue };
-                if p.h[i0..=i1].iter().all(|&h| h < 0.4) {
-                    continue;
-                }
+            // Only patches deep enough to see: each run of snowy cells is its own
+            // mound, sloping down to the bare edge at both ends (no film, no line).
+            for (i0, i1) in p.runs() {
+                let x_start = p.cell_x(i0) - p.cell * 0.5;
+                let x_end = p.cell_x(i1) + p.cell * 0.5;
                 pts.clear();
-                pts.push(D2D_POINT_2F { x: a, y: p.y - p.h[i0] });
                 for i in i0..=i1 {
-                    pts.push(D2D_POINT_2F { x: p.cell_x(i).clamp(a, b), y: p.y - p.h[i] });
+                    pts.push(D2D_POINT_2F { x: p.cell_x(i), y: p.y - p.h[i] });
                 }
-                pts.push(D2D_POINT_2F { x: b, y: p.y - p.h[i1] });
+                pts.push(D2D_POINT_2F { x: x_end, y: p.y });
 
-                fs.BeginFigure(D2D_POINT_2F { x: a, y: p.y + 0.5 }, D2D1_FIGURE_BEGIN_FILLED);
+                fs.BeginFigure(D2D_POINT_2F { x: x_start, y: p.y }, D2D1_FIGURE_BEGIN_FILLED);
                 fs.AddLines(&pts);
-                fs.AddLine(D2D_POINT_2F { x: b, y: p.y + 0.5 });
                 fs.EndFigure(D2D1_FIGURE_END_CLOSED);
 
-                cs.BeginFigure(pts[0], D2D1_FIGURE_BEGIN_HOLLOW);
-                cs.AddLines(&pts[1..]);
+                cs.BeginFigure(D2D_POINT_2F { x: x_start, y: p.y }, D2D1_FIGURE_BEGIN_HOLLOW);
+                cs.AddLines(&pts);
                 cs.EndFigure(D2D1_FIGURE_END_OPEN);
                 any = true;
             }

@@ -19,7 +19,7 @@ use windows::Win32::UI::Shell::{
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 
-use crate::config::{self, Config};
+use crate::config::{self, Config, PileDepth};
 use crate::snow::{FlakeSize, Intensity, Snow, Weather, Wind};
 use crate::{autostart, render::Renderer, scan};
 
@@ -33,6 +33,8 @@ const ID_WIND: u32 = 120; // + index
 const ID_WIND_LEFT: u32 = 125;
 const ID_WIND_RIGHT: u32 = 126;
 const ID_SIZE: u32 = 130; // + index
+const ID_PILES: u32 = 135; // + index
+const ID_CLEAR: u32 = 139;
 const ID_AUTOSTART: u32 = 140;
 const ID_ABOUT: u32 = 150;
 const ID_EXIT: u32 = 160;
@@ -254,7 +256,10 @@ fn frame() {
         if now - a.last_scan >= Duration::from_millis(50) {
             let interval = (now - a.last_scan).as_secs_f32().min(0.5);
             a.last_scan = now;
-            let ledges = scan::ledges(&[a.overlay, a.tray], a.origin, dpi_scale());
+            let ledges = match a.cfg.piles.window_px() {
+                Some(px) => scan::ledges(&[a.overlay, a.tray], a.origin, px * dpi_scale()),
+                None => Vec::new(),
+            };
             a.snow.set_ledges(&ledges, interval);
         }
         let mut pt = POINT::default();
@@ -431,6 +436,14 @@ fn show_menu(tray: HWND) {
             }
             append_sub(menu, sub, "雪花大小");
         }
+        if let Ok(sub) = CreatePopupMenu() {
+            let names = ["不积雪", "薄", "中", "厚"];
+            for (i, v) in PileDepth::ALL.iter().enumerate() {
+                append(sub, ID_PILES + i as u32, names[i], cfg.piles == *v);
+            }
+            append_sub(menu, sub, "积雪厚度");
+        }
+        append(menu, ID_CLEAR, "清除积雪", false);
         separator(menu);
         append(menu, ID_AUTOSTART, "开机自动启动", autostart::is_enabled());
         append(menu, ID_ABOUT, &format!("关于 Snow {}", env!("CARGO_PKG_VERSION")), false);
@@ -469,6 +482,9 @@ fn run_command(id: u32) {
         ID_WIND_LEFT => set_weather(|w| w.wind_dir = -1.0),
         ID_WIND_RIGHT => set_weather(|w| w.wind_dir = 1.0),
         ID_AUTOSTART => autostart::set(!autostart::is_enabled()),
+        ID_CLEAR => {
+            with_app(|a| a.snow.clear_piles());
+        }
         ID_ABOUT => message_box(&format!(
             "Snow {}\n\n让雪花落在你的桌面上。\n\n快捷键：Ctrl+Alt+S 暂停 / 继续\n设置保存在：%APPDATA%\\Snow\\config.txt",
             env!("CARGO_PKG_VERSION")
@@ -479,6 +495,14 @@ fn run_command(id: u32) {
         }
         _ if (ID_WIND..ID_WIND + 3).contains(&id) => set_weather(|w| w.wind = Wind::ALL[(id - ID_WIND) as usize]),
         _ if (ID_SIZE..ID_SIZE + 3).contains(&id) => set_weather(|w| w.size = FlakeSize::ALL[(id - ID_SIZE) as usize]),
+        _ if (ID_PILES..ID_PILES + 4).contains(&id) => {
+            with_app(|a| {
+                a.cfg.piles = PileDepth::ALL[(id - ID_PILES) as usize];
+                config::save(&a.cfg);
+                // Rescan on the next frame so the new limit applies right away.
+                a.last_scan = Instant::now() - Duration::from_secs(1);
+            });
+        }
         _ => {}
     }
 }

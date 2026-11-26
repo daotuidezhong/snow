@@ -2,10 +2,48 @@
 
 use crate::snow::{FlakeSize, Intensity, Weather, Wind};
 
+/// How deep snow may pile up on windows and the taskbar.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum PileDepth {
+    Off,
+    Thin,
+    #[default]
+    Medium,
+    Thick,
+}
+
+impl PileDepth {
+    pub const ALL: [PileDepth; 4] = [Self::Off, Self::Thin, Self::Medium, Self::Thick];
+
+    /// Maximum depth on a window's top edge, in logical pixels (None = no piles).
+    pub fn window_px(self) -> Option<f32> {
+        match self {
+            Self::Off => None,
+            Self::Thin => Some(6.0),
+            Self::Medium => Some(11.0),
+            Self::Thick => Some(18.0),
+        }
+    }
+
+    pub fn key(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Thin => "thin",
+            Self::Medium => "medium",
+            Self::Thick => "thick",
+        }
+    }
+
+    pub fn from_key(s: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|v| v.key() == s)
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Debug, Default)]
 pub struct Config {
     pub weather: Weather,
     pub paused: bool,
+    pub piles: PileDepth,
 }
 
 impl Config {
@@ -32,6 +70,11 @@ impl Config {
                     }
                 }
                 "paused" => c.paused = v == "true",
+                "piles" => {
+                    if let Some(x) = PileDepth::from_key(v) {
+                        c.piles = x
+                    }
+                }
                 _ => {}
             }
         }
@@ -40,12 +83,13 @@ impl Config {
 
     pub fn serialize(&self) -> String {
         format!(
-            "# Snow settings\nintensity={}\nwind={}\nwind_dir={}\nsize={}\npaused={}\n",
+            "# Snow settings\nintensity={}\nwind={}\nwind_dir={}\nsize={}\npaused={}\npiles={}\n",
             self.weather.intensity.key(),
             self.weather.wind.key(),
             if self.weather.wind_dir < 0.0 { "left" } else { "right" },
             self.weather.size.key(),
             self.paused,
+            self.piles.key(),
         )
     }
 }
@@ -77,6 +121,7 @@ mod tests {
         let c = Config {
             weather: Weather { intensity: Intensity::Blizzard, wind: Wind::Strong, wind_dir: -1.0, size: FlakeSize::Large },
             paused: true,
+            piles: PileDepth::Thick,
         };
         assert_eq!(Config::parse(&c.serialize()), c);
     }

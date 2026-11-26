@@ -63,7 +63,10 @@ const SLOPE: f32 = 0.6;
 /// Slope of the rounded ends of a pile near the window corners.
 const END_SLOPE: f32 = 0.45;
 /// How fast bumps flatten out each frame (0..0.5). Keeps the surface soft, not jagged.
+/// It only acts where snow is already established, so fresh snow stays in patches.
 const SMOOTH: f32 = 0.07;
+/// Below this depth (px) snow is a film that slowly vanishes instead of being drawn.
+pub const MIN_VISIBLE: f32 = 0.8;
 
 impl Pile {
     pub fn new(l: &Ledge, cell: f32) -> Self {
@@ -132,15 +135,15 @@ impl Pile {
         self.cell_at(x).is_some_and(|i| self.h[i] >= self.cap(i) - 0.3)
     }
 
-    /// Add `area` square pixels of snow at `x`, spread over a few cells.
+    /// Add `area` square pixels of snow at `x`, mostly on the cell it hit.
     /// Anything over the limit is sorted out (or spilled) by `relax`.
     pub fn deposit(&mut self, x: f32, area: f32) {
         let Some(i) = self.cell_at(x) else { return };
         let dh = area / self.cell;
         let n = self.h.len();
-        self.h[i] += dh * 0.5;
-        self.h[if i > 0 { i - 1 } else { i }] += dh * 0.25;
-        self.h[if i + 1 < n { i + 1 } else { i }] += dh * 0.25;
+        self.h[i] += dh * 0.6;
+        self.h[if i > 0 { i - 1 } else { i }] += dh * 0.2;
+        self.h[if i + 1 < n { i + 1 } else { i }] += dh * 0.2;
     }
 
     /// One frame of settling: steep steps slide down, bumps diffuse, and snow
@@ -156,12 +159,30 @@ impl Pile {
                 self.h[i + 1] += m;
             }
         }
-        if n >= 3 {
+        if n >= 2 {
+            // Conservative smoothing between neighbours, weighted by how established the
+            // snow is on *both* sides: never spreads a film onto bare cells.
             self.scratch.clear();
             self.scratch.extend_from_slice(&self.h);
-            for i in 1..n - 1 {
-                let lap = self.scratch[i - 1] + self.scratch[i + 1] - 2.0 * self.scratch[i];
-                self.h[i] += SMOOTH * 0.5 * lap;
+            for i in 0..n - 1 {
+                let (a, b) = (self.scratch[i], self.scratch[i + 1]);
+                let w = ((a.min(b) - MIN_VISIBLE) / 2.5).clamp(0.0, 1.0);
+                if w > 0.0 {
+                    let flux = SMOOTH * 0.5 * (a - b) * w;
+                    self.h[i] -= flux;
+                    self.h[i + 1] += flux;
+                }
+            }
+        }
+        // A thin film with no snow around it fades away (sublimates) instead of
+        // lingering as a line along the window edge.
+        for i in 0..n {
+            if self.h[i] > 0.0 && self.h[i] < MIN_VISIBLE {
+                let left = if i > 0 { self.h[i - 1] } else { 0.0 };
+                let right = if i + 1 < n { self.h[i + 1] } else { 0.0 };
+                if left < MIN_VISIBLE && right < MIN_VISIBLE {
+                    self.h[i] = (self.h[i] - 0.004).max(0.0);
+                }
             }
         }
         for i in 0..n {
@@ -189,17 +210,33 @@ impl Pile {
         self.h.iter().sum::<f32>() * self.cell
     }
 
-    /// Remove snow within `radius` of `x`; returns (cell x, cell top y, removed area) per cell.
+    /// Clear all snow within `radius` of `x`, down to the bare edge.
+    /// Returns (cell x, cell top y, removed area) per cell.
     pub fn brush(&mut self, x: f32, radius: f32) -> Vec<(f32, f32, f32)> {
         let mut out = Vec::new();
         for i in 0..self.h.len() {
             let cx = self.cell_x(i);
-            let d = (cx - x).abs();
-            if d <= radius && self.is_visible(cx) && self.h[i] > 0.0 {
-                // The middle of the swipe clears everything; its edge only takes the top off.
-                let take = self.h[i] * (1.0 - (d / radius).powi(4));
-                out.push((cx, self.y - self.h[i], take * self.cell));
-                self.h[i] -= take;
+            if (cx - x).abs() <= radius && self.is_visible(cx) && self.h[i] > 0.0 {
+                out.push((cx, self.y - self.h[i], self.h[i] * self.cell));
+                self.h[i] = 0.0;
+            }
+        }
+        out
+    }
+
+    /// Runs of neighbouring visible cells deep enough to draw, as inclusive (first, last) cell indices.
+    pub fn runs(&self) -> Vec<(usize, usize)> {
+        let mut out = Vec::new();
+        let mut start: Option<usize> = None;
+        for i in 0..=self.h.len() {
+            let on = i < self.h.len() && self.h[i] >= MIN_VISIBLE && self.is_visible(self.cell_x(i));
+            match (on, start) {
+                (true, None) => start = Some(i),
+                (false, Some(a)) => {
+                    out.push((a, i - 1));
+                    start = None;
+                }
+                _ => {}
             }
         }
         out
@@ -320,6 +357,30 @@ mod tests {
     }
 
     #[test]
+    fn fresh_snow_stays_in_patches_and_stray_film_fades() {
+        let mut p = Pile::new(&ledge(0.0, 300.0), 3.0);
+        // A few flakes land in one spot.
+        for _ in 0..6 {
+            p.deposit(150.0, 12.0);
+        }
+        for _ in 0..600 {
+            p.relax();
+        }
+        let runs = p.runs();
+        assert_eq!(runs.len(), 1, "one patch: {runs:?}");
+        let (a, b) = runs[0];
+        assert!(b - a < 15, "the patch stays local ({a}..{b})");
+        assert!(p.h[..30].iter().all(|&h| h == 0.0) && p.h[70..].iter().all(|&h| h == 0.0), "no film elsewhere");
+        // A lone speck evaporates rather than lingering as a line.
+        let mut q = Pile::new(&ledge(0.0, 300.0), 3.0);
+        q.h[40] = 0.5;
+        for _ in 0..600 {
+            q.relax();
+        }
+        assert_eq!(q.h[40], 0.0);
+    }
+
+    #[test]
     fn hidden_parts_take_no_snow() {
         let mut l = ledge(0.0, 300.0);
         l.visible = vec![(0.0, 100.0), (200.0, 300.0)];
@@ -340,7 +401,9 @@ mod tests {
         let removed: f32 = p.brush(150.0, 20.0).iter().map(|c| c.2).sum();
         assert!(removed > 0.0);
         assert!((p.amount() - (before - removed)).abs() < 1.0);
-        assert!(p.h[50] < 0.01, "centre of the swipe is cleared");
+        let i0 = p.cell_at(131.0).unwrap();
+        let i1 = p.cell_at(169.0).unwrap();
+        assert!(p.h[i0..=i1].iter().all(|&h| h == 0.0), "the swipe clears right down to the edge");
         let mut puffs = Vec::new();
         p.shake_off(&mut Rng::new(5), 1.0, (400.0, 0.0), &mut puffs);
         let area: f32 = puffs.iter().map(|q| std::f32::consts::PI * q.r * q.r).sum();

@@ -68,7 +68,9 @@ unsafe extern "system" fn collect(hwnd: HWND, lp: LPARAM) -> BOOL {
 }
 
 /// Scan the desktop. `origin` is the overlay's top-left in screen coordinates.
-pub fn ledges(own: &[HWND], origin: (i32, i32), scale: f32) -> Vec<Ledge> {
+/// `window_max` is the deepest snow allowed on a window's top edge, in physical
+/// pixels; taskbars allow a little more.
+pub fn ledges(own: &[HWND], origin: (i32, i32), window_max: f32) -> Vec<Ledge> {
     let (ox, oy) = (origin.0 as f32, origin.1 as f32);
     let mut out = Vec::new();
     unsafe {
@@ -113,7 +115,7 @@ pub fn ledges(own: &[HWND], origin: (i32, i32), scale: f32) -> Vec<Ledge> {
                 x1: r.right as f32 - ox,
                 y: y - oy,
                 visible: visible.into_iter().map(|(a, b)| (a - ox, b - ox)).collect(),
-                max_h: 22.0 * scale,
+                max_h: window_max,
             });
         }
 
@@ -142,7 +144,7 @@ pub fn ledges(own: &[HWND], origin: (i32, i32), scale: f32) -> Vec<Ledge> {
                     x1,
                     y: r.top as f32 - oy,
                     visible: vec![(x0, x1)],
-                    max_h: 30.0 * scale,
+                    max_h: window_max * 1.4,
                 });
                 k += 1;
             }

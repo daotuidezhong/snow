@@ -126,6 +126,9 @@ impl Default for Weather {
     }
 }
 
+/// Share of a landing flake's area that becomes pile depth. Lower = slower build-up.
+const DEPOSIT: f32 = 0.35;
+
 /// What a flake looks like, which also decides how it moves.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kind {
@@ -167,6 +170,9 @@ pub struct Flake {
     fall: f32,
     /// Seconds to catch up with the air (inertia).
     tau: f32,
+    /// Passed over a window's top edge without settling there: it is in front of
+    /// that window now, so it must not land on anything the window shelters.
+    sheltered: bool,
 }
 
 /// Small, fast, deterministic PRNG (xorshift64*). Good enough for snow.
@@ -372,6 +378,16 @@ impl Snow {
         }
     }
 
+    /// Knock all settled snow off at once (menu: clear snow). It falls as clumps.
+    pub fn clear_piles(&mut self) {
+        for p in &mut self.piles {
+            p.shake_off(&mut self.rng, self.scale, (0.0, 0.0), &mut self.puffs);
+            p.h.iter_mut().for_each(|h| *h = 0.0);
+            p.spill_left = 0.0;
+            p.spill_right = 0.0;
+        }
+    }
+
     /// Mouse position in overlay pixels (None when unknown). Call once per frame before `step`.
     pub fn set_cursor(&mut self, pos: Option<(f32, f32)>, dt: f32) {
         self.prev_cursor = self.cursor;
@@ -431,10 +447,11 @@ impl Snow {
         let kind = if depth >= 0.985 {
             Kind::Bokeh
         } else if depth > 0.55 {
-            match rng.f() {
-                v if v < 0.42 => Kind::Crystal,
-                v if v < 0.8 => Kind::Fluff,
-                _ => Kind::Disc,
+            // Up close, real flakes show structure: never a smooth ball.
+            if rng.f() < 0.5 {
+                Kind::Crystal
+            } else {
+                Kind::Fluff
             }
         } else if depth > 0.35 && rng.f() < 0.3 {
             Kind::Fluff
@@ -481,6 +498,7 @@ impl Snow {
             squash: 1.0,
             fall,
             tau,
+            sheltered: false,
         };
         f.r = self.radius_for(depth, kind);
         f.y = -f.r * 3.0 - self.rng.range(0.0, 0.08 * self.height);
@@ -611,14 +629,22 @@ impl Snow {
             f.angle += f.spin * dt;
 
             // Only nearer flakes land; far ones read as falling behind the windows.
-            if f.depth > 0.3 && f.kind != Kind::Bokeh {
+            // A window is a roof: a flake that crosses its top edge either settles
+            // there or (pile full) carries on in front of it, never reaching the
+            // piles the window shelters.
+            if f.depth > 0.3 && f.kind != Kind::Bokeh && !f.sheltered {
                 for pile in &mut self.piles {
                     if let Some(top) = pile.surface(f.x) {
-                        if prev_y < top && f.y >= top && !pile.is_full_at(f.x) {
-                            let m = f.r.min(4.0 * s);
-                            pile.deposit(f.x, std::f32::consts::PI * m * m * land_area);
-                            // Mark as gone; it is recycled below.
-                            f.y = h + 10_000.0;
+                        if prev_y < top && f.y >= top {
+                            if pile.is_full_at(f.x) {
+                                f.sheltered = true;
+                            } else {
+                                // One flake is a little snow: piles build up over minutes.
+                                let m = f.r.min(4.0 * s);
+                                pile.deposit(f.x, std::f32::consts::PI * m * m * land_area * DEPOSIT);
+                                // Mark as gone; it is recycled below.
+                                f.y = h + 10_000.0;
+                            }
                             break;
                         }
                     }
@@ -927,23 +953,50 @@ mod tests {
     }
 
     #[test]
-    fn piles_fill_and_full_piles_do_not_shelter_whats_below() {
+    fn snow_builds_up_gradually_and_windows_shelter_whats_below() {
         let w = Weather { wind: Wind::Calm, ..Weather::default() };
         let mut s = Snow::new(1000.0, 800.0, 1.0, w, 5);
         let ledges = [
-            Ledge { id: 1, x0: 0.0, x1: 500.0, y: 300.0, visible: vec![(0.0, 500.0)], max_h: 10.0 },
-            Ledge { id: 2, x0: 0.0, x1: 1000.0, y: 700.0, visible: vec![(0.0, 1000.0)], max_h: 20.0 },
+            // A window whose top edge is at y=300, spanning the left half.
+            Ledge { id: 1, x0: 0.0, x1: 500.0, y: 300.0, visible: vec![(0.0, 500.0)], max_h: 12.0 },
+            // The taskbar below everything.
+            Ledge { id: 2, x0: 0.0, x1: 1000.0, y: 700.0, visible: vec![(0.0, 1000.0)], max_h: 16.0 },
         ];
         s.set_ledges(&ledges, 0.1);
+        // After 20 s: some snow, but in patches, not a full-width layer.
+        for _ in 0..60 * 20 {
+            s.step(1.0 / 60.0);
+        }
+        let top = &s.piles[0];
+        let covered = top.h.iter().filter(|&&h| h >= crate::pile::MIN_VISIBLE).count();
+        assert!(covered > 0, "snow has started to settle");
+        assert!(covered < top.h.len() * 6 / 10, "but not as a full layer yet ({covered}/{})", top.h.len());
+        // After several minutes the window is snowed in, within its limit.
         for _ in 0..60 * 400 {
             s.step(1.0 / 60.0);
         }
-        assert!(s.piles[0].amount() > 500.0 * 6.0, "upper pile fills");
+        let top = &s.piles[0];
+        let max = top.h.iter().cloned().fold(0.0, f32::max);
+        assert!(max > 9.0 && max <= 12.0 + 1e-3, "fills up to the limit and no further ({max})");
+        // The taskbar under the window stays nearly bare; the open half is snowy.
         let low = &s.piles[1];
         let n = low.h.len();
         let under: f32 = low.h[n / 10..n * 4 / 10].iter().sum::<f32>();
         let open: f32 = low.h[n * 6 / 10..n * 9 / 10].iter().sum::<f32>();
-        assert!(under > open * 0.8, "under {under} vs open {open}");
+        assert!(under < open * 0.25, "sheltered {under} vs open {open}");
+    }
+
+    #[test]
+    fn clearing_knocks_all_snow_off() {
+        let w = Weather { wind: Wind::Calm, ..Weather::default() };
+        let mut s = Snow::new(1000.0, 800.0, 1.0, w, 6);
+        s.set_ledges(&[Ledge { id: 1, x0: 0.0, x1: 500.0, y: 300.0, visible: vec![(0.0, 500.0)], max_h: 12.0 }], 0.1);
+        for k in 0..2000 {
+            s.piles[0].deposit((k % 500) as f32, 30.0);
+        }
+        s.clear_piles();
+        assert!(s.piles[0].h.iter().all(|&h| h == 0.0));
+        assert!(!s.puffs.is_empty(), "the snow falls off as clumps");
     }
 
     #[test]

@@ -62,11 +62,15 @@ pub struct Puff {
 const SLOPE: f32 = 0.6;
 /// Slope of the rounded ends of a pile near the window corners.
 const END_SLOPE: f32 = 0.45;
-/// How fast bumps flatten out each frame (0..0.5). Keeps the surface soft, not jagged.
-/// It only acts where snow is already established, so fresh snow stays in patches.
-const SMOOTH: f32 = 0.07;
-/// Below this depth (px) snow is a film that slowly vanishes instead of being drawn.
-pub const MIN_VISIBLE: f32 = 0.8;
+/// How fast snow evens out between neighbours each frame (0..0.5): dips fill in,
+/// so a layer spreads over its surroundings before it builds up.
+const SMOOTH: f32 = 0.12;
+/// How far a landing flake's snow is spread, in cells (Gaussian sigma).
+const SPREAD: f32 = 6.0;
+/// Thinner than this (px) and isolated, snow is a film that slowly vanishes.
+const FILM: f32 = 0.2;
+/// Thinner than this (px), snow is not drawn.
+pub const MIN_VISIBLE: f32 = 0.3;
 
 impl Pile {
     pub fn new(l: &Ledge, cell: f32) -> Self {
@@ -135,15 +139,21 @@ impl Pile {
         self.cell_at(x).is_some_and(|i| self.h[i] >= self.cap(i) - 0.3)
     }
 
-    /// Add `area` square pixels of snow at `x`, mostly on the cell it hit.
-    /// Anything over the limit is sorted out (or spilled) by `relax`.
+    /// Add `area` square pixels of snow around `x`. A flake's snow settles over a
+    /// small neighbourhood (light fresh snow doesn't stack in a spike), so the
+    /// surface rises as an even layer. Overflow is sorted out by `relax`.
     pub fn deposit(&mut self, x: f32, area: f32) {
         let Some(i) = self.cell_at(x) else { return };
-        let dh = area / self.cell;
-        let n = self.h.len();
-        self.h[i] += dh * 0.6;
-        self.h[if i > 0 { i - 1 } else { i }] += dh * 0.2;
-        self.h[if i + 1 < n { i + 1 } else { i }] += dh * 0.2;
+        let n = self.h.len() as isize;
+        let r = (SPREAD * 3.0) as isize;
+        let lo = (i as isize - r).max(0);
+        let hi = (i as isize + r).min(n - 1);
+        let w = |j: isize| (-((j - i as isize) as f32).powi(2) / (2.0 * SPREAD * SPREAD)).exp();
+        let total: f32 = (lo..=hi).map(w).sum();
+        let dh = area / self.cell / total;
+        for j in lo..=hi {
+            self.h[j as usize] += dh * w(j);
+        }
     }
 
     /// One frame of settling: steep steps slide down, bumps diffuse, and snow
@@ -160,28 +170,25 @@ impl Pile {
             }
         }
         if n >= 2 {
-            // Conservative smoothing between neighbours, weighted by how established the
-            // snow is on *both* sides: never spreads a film onto bare cells.
+            // Conservative smoothing between neighbours: higher cells shed into lower
+            // ones, so snow fills its surroundings and the layer rises evenly.
             self.scratch.clear();
             self.scratch.extend_from_slice(&self.h);
             for i in 0..n - 1 {
                 let (a, b) = (self.scratch[i], self.scratch[i + 1]);
-                let w = ((a.min(b) - MIN_VISIBLE) / 2.5).clamp(0.0, 1.0);
-                if w > 0.0 {
-                    let flux = SMOOTH * 0.5 * (a - b) * w;
-                    self.h[i] -= flux;
-                    self.h[i + 1] += flux;
-                }
+                let flux = SMOOTH * 0.5 * (a - b);
+                self.h[i] -= flux;
+                self.h[i + 1] += flux;
             }
         }
-        // A thin film with no snow around it fades away (sublimates) instead of
-        // lingering as a line along the window edge.
+        // The thin fringe of a patch, or a stray speck, fades away (sublimates)
+        // instead of creeping along the whole edge as an invisible film.
         for i in 0..n {
-            if self.h[i] > 0.0 && self.h[i] < MIN_VISIBLE {
+            if self.h[i] > 0.0 && self.h[i] < FILM {
                 let left = if i > 0 { self.h[i - 1] } else { 0.0 };
                 let right = if i + 1 < n { self.h[i + 1] } else { 0.0 };
-                if left < MIN_VISIBLE && right < MIN_VISIBLE {
-                    self.h[i] = (self.h[i] - 0.004).max(0.0);
+                if left < FILM * 2.0 && right < FILM * 2.0 {
+                    self.h[i] = (self.h[i] - 0.003).max(0.0);
                 }
             }
         }
@@ -357,27 +364,40 @@ mod tests {
     }
 
     #[test]
-    fn fresh_snow_stays_in_patches_and_stray_film_fades() {
-        let mut p = Pile::new(&ledge(0.0, 300.0), 3.0);
-        // A few flakes land in one spot.
-        for _ in 0..6 {
-            p.deposit(150.0, 12.0);
-        }
-        for _ in 0..600 {
+    fn snow_spreads_over_its_surroundings_before_it_builds_up() {
+        let mut p = Pile::new(&ledge(0.0, 600.0), 3.0);
+        let mut first_wide = None;
+        // Flakes keep landing around one spot.
+        for k in 0..4000 {
+            p.deposit(300.0 + ((k * 37) % 21) as f32 - 10.0, 6.0);
             p.relax();
+            let max = p.h.iter().cloned().fold(0.0, f32::max);
+            let wide = p.h.iter().filter(|&&h| h >= MIN_VISIBLE).count();
+            if first_wide.is_none() && wide >= 25 {
+                first_wide = Some(max);
+            }
         }
+        // By the time it covers 25 cells (75 px) it is still a thin layer...
+        let max_when_wide = first_wide.expect("the layer spreads out");
+        assert!(max_when_wide < 2.5, "spreads first ({max_when_wide} px tall when 75 px wide)");
+        // ...and then it builds up into a smooth mound, no blocks or steps.
+        let max = p.h.iter().cloned().fold(0.0, f32::max);
+        assert!(max > 6.0, "then builds up ({max})");
         let runs = p.runs();
-        assert_eq!(runs.len(), 1, "one patch: {runs:?}");
-        let (a, b) = runs[0];
-        assert!(b - a < 15, "the patch stays local ({a}..{b})");
-        assert!(p.h[..30].iter().all(|&h| h == 0.0) && p.h[70..].iter().all(|&h| h == 0.0), "no film elsewhere");
-        // A lone speck evaporates rather than lingering as a line.
+        assert_eq!(runs.len(), 1, "one continuous mound: {runs:?}");
+        for w in p.h.windows(2) {
+            assert!((w[0] - w[1]).abs() < 0.8, "no steps: {w:?}");
+        }
+    }
+
+    #[test]
+    fn stray_film_fades() {
         let mut q = Pile::new(&ledge(0.0, 300.0), 3.0);
-        q.h[40] = 0.5;
+        q.h[40] = 0.15;
         for _ in 0..600 {
             q.relax();
         }
-        assert_eq!(q.h[40], 0.0);
+        assert!(q.h.iter().all(|&h| h < 0.01));
     }
 
     #[test]

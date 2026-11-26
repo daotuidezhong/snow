@@ -154,9 +154,11 @@ impl Renderer {
 
             // Snow is bright on top and picks up a cool blue shade toward its base.
             let stops = [
+                // Mostly white so a fresh thin layer reads as snow, not a blue line;
+                // only the base of a deep drift picks up the cool shade.
                 D2D1_GRADIENT_STOP { position: 0.0, color: color(1.0, 1.0, 1.0, 1.0) },
-                D2D1_GRADIENT_STOP { position: 0.45, color: color(0.95, 0.97, 1.0, 1.0) },
-                D2D1_GRADIENT_STOP { position: 1.0, color: color(0.77, 0.84, 0.94, 1.0) },
+                D2D1_GRADIENT_STOP { position: 0.7, color: color(0.96, 0.975, 1.0, 1.0) },
+                D2D1_GRADIENT_STOP { position: 1.0, color: color(0.85, 0.89, 0.96, 1.0) },
             ];
             // The simple overload lives on ID2D1RenderTarget; the device context shadows it.
             let rt: ID2D1RenderTarget = dc.cast()?;
@@ -229,24 +231,24 @@ impl Renderer {
         self.rects.push(D2D_RECT_F { left: -half, top: -half, right: half, bottom: half });
         let (x0, y0, x1, y1) = art::cell_rect(id);
         self.srcs.push(D2D_RECT_U { left: x0, top: y0, right: x1, bottom: y1 });
-        // Premultiplied tint: scales the whole sprite by `alpha`.
-        self.colors.push(color(alpha, alpha, alpha, alpha));
+        // Sprite colours are straight alpha: D2D premultiplies them itself.
+        // (Passing a premultiplied tint darkened faint flakes into grey rings.)
+        self.colors.push(color(1.0, 1.0, 1.0, alpha));
         let (s, c) = angle.sin_cos();
         // Row-vector convention: squash along local x, then rotate, then move.
         self.xforms.push(Matrix3x2 { M11: squash * c, M12: squash * s, M21: -s, M22: c, M31: x, M32: y });
     }
 
-    /// Build the fill and crest geometry for one pile's visible parts.
-    fn pile_geometry(&self, p: &Pile) -> Result<Option<(ID2D1PathGeometry1, ID2D1PathGeometry1)>> {
+    /// Geometry for one pile's visible snow: the body of every patch, plus the
+    /// body and top line of the patches thick enough for an outline and shadow.
+    /// Thin, fresh snow gets neither, so it never reads as a line along the edge.
+    fn pile_geometry(&self, p: &Pile) -> Result<Option<[ID2D1PathGeometry1; 3]>> {
+        let thick = 2.5 * self.scale;
         unsafe {
-            let fill = self.factory.CreatePathGeometry()?;
-            let crest = self.factory.CreatePathGeometry()?;
-            let fs = fill.Open()?;
-            let cs = crest.Open()?;
+            let geoms = [self.factory.CreatePathGeometry()?, self.factory.CreatePathGeometry()?, self.factory.CreatePathGeometry()?];
+            let sinks = [geoms[0].Open()?, geoms[1].Open()?, geoms[2].Open()?];
             let mut any = false;
             let mut pts: Vec<D2D_POINT_2F> = Vec::new();
-            // Only patches deep enough to see: each run of snowy cells is its own
-            // mound, sloping down to the bare edge at both ends (no film, no line).
             for (i0, i1) in p.runs() {
                 let x_start = p.cell_x(i0) - p.cell * 0.5;
                 let x_end = p.cell_x(i1) + p.cell * 0.5;
@@ -255,19 +257,33 @@ impl Renderer {
                     pts.push(D2D_POINT_2F { x: p.cell_x(i), y: p.y - p.h[i] });
                 }
                 pts.push(D2D_POINT_2F { x: x_end, y: p.y });
-
-                fs.BeginFigure(D2D_POINT_2F { x: x_start, y: p.y }, D2D1_FIGURE_BEGIN_FILLED);
-                fs.AddLines(&pts);
-                fs.EndFigure(D2D1_FIGURE_END_CLOSED);
-
-                cs.BeginFigure(D2D_POINT_2F { x: x_start, y: p.y }, D2D1_FIGURE_BEGIN_HOLLOW);
-                cs.AddLines(&pts);
-                cs.EndFigure(D2D1_FIGURE_END_OPEN);
+                let start = D2D_POINT_2F { x: x_start, y: p.y };
+                let is_thick = p.h[i0..=i1].iter().any(|&h| h >= thick);
+                for (k, sink) in sinks.iter().enumerate() {
+                    if k > 0 && !is_thick {
+                        continue;
+                    }
+                    if k < 2 {
+                        sink.BeginFigure(start, D2D1_FIGURE_BEGIN_FILLED);
+                        sink.AddLines(&pts);
+                        sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+                    } else {
+                        // Only the part of the top line that is actually raised.
+                        let raised: Vec<D2D_POINT_2F> =
+                            pts.iter().copied().filter(|q| p.y - q.y >= thick * 0.6).collect();
+                        if raised.len() >= 2 {
+                            sink.BeginFigure(raised[0], D2D1_FIGURE_BEGIN_HOLLOW);
+                            sink.AddLines(&raised[1..]);
+                            sink.EndFigure(D2D1_FIGURE_END_OPEN);
+                        }
+                    }
+                }
                 any = true;
             }
-            fs.Close()?;
-            cs.Close()?;
-            Ok(any.then_some((fill, crest)))
+            for sink in &sinks {
+                sink.Close()?;
+            }
+            Ok(any.then_some(geoms))
         }
     }
 
@@ -277,10 +293,10 @@ impl Renderer {
         unsafe {
             self.dc.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             for p in piles {
-                let Some((fill, crest)) = self.pile_geometry(p)? else { continue };
-                // Soft contact shadow on the window just below and right of the snow.
+                let Some([fill, thick_fill, crest]) = self.pile_geometry(p)? else { continue };
+                // Soft contact shadow on the window just below and right of thick snow.
                 self.dc.SetTransform(&translate(0.8 * s, 1.6 * s));
-                self.dc.FillGeometry(&fill, &self.shadow_brush, None);
+                self.dc.FillGeometry(&thick_fill, &self.shadow_brush, None);
                 self.dc.SetTransform(&identity());
                 // Thin cool outline so white snow reads against white title bars.
                 self.dc.DrawGeometry(&crest, &self.edge_brush, 1.6 * s, None);

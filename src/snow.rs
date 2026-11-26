@@ -443,7 +443,7 @@ impl Snow {
     fn spawn(&mut self) -> Flake {
         let rng = &mut self.rng;
         // Most flakes are far away; a rare few drift right past the "lens".
-        let depth = if rng.f() < 0.004 { rng.range(0.985, 1.0) } else { rng.f().powf(1.6) * 0.98 };
+        let depth = rng.f().powf(1.6) * 0.98;
         let kind = if depth >= 0.985 {
             Kind::Bokeh
         } else if depth > 0.55 {
@@ -579,17 +579,6 @@ impl Snow {
         self.gust_advect += (self.wind_now + 0.33 * self.gust_amp * self.weather.wind_dir) * dt;
         self.update_air();
 
-        // Cursor wake: the air along the mouse's path is dragged with it.
-        let wake = match (self.prev_cursor, self.cursor) {
-            (Some(a), Some(b)) => {
-                let (vx, vy) = (self.cursor_v.0 / s, self.cursor_v.1 / s);
-                let speed = (vx * vx + vy * vy).sqrt();
-                (speed > 150.0).then_some((a, b, vx.clamp(-2500.0, 2500.0), vy.clamp(-2500.0, 2500.0)))
-            }
-            _ => None,
-        };
-        let wake_r = 60.0 * s;
-
         let fall_boost = if blizzard { 1.6 } else { 1.0 };
         let land_area = if blizzard { 1.3 } else { 1.0 };
         for idx in 0..self.flakes.len() {
@@ -608,15 +597,6 @@ impl Snow {
             let k = 1.0 - (-dt / f.tau).exp();
             f.vx += (tx - f.vx) * k;
             f.vy += (ty - f.vy) * k;
-            if let Some((a, b, cvx, cvy)) = wake {
-                let d = seg_dist(f.x, f.y, a.0, a.1, b.0, b.1);
-                if d < wake_r {
-                    let fo = (1.0 - d / wake_r).powi(2) * (dt * 14.0).min(1.0);
-                    f.vx += (cvx * 0.7 - f.vx) * fo;
-                    f.vy += (cvy * 0.7 - f.vy) * fo;
-                    f.spin += (cvx.signum() * 6.0 - f.spin) * fo;
-                }
-            }
             f.x += f.vx * s * dt;
             f.y += f.vy * s * dt;
             // Tumbling: crystals turn edge-on and back; their spin follows the glide.
@@ -868,12 +848,6 @@ impl Snow {
     }
 }
 
-fn seg_dist(px: f32, py: f32, ax: f32, ay: f32, bx: f32, by: f32) -> f32 {
-    let (dx, dy) = (bx - ax, by - ay);
-    let t = (((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy).max(1e-6)).clamp(0.0, 1.0);
-    ((px - ax - t * dx).powi(2) + (py - ay - t * dy).powi(2)).sqrt()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -963,14 +937,21 @@ mod tests {
             Ledge { id: 2, x0: 0.0, x1: 1000.0, y: 700.0, visible: vec![(0.0, 1000.0)], max_h: 16.0 },
         ];
         s.set_ledges(&ledges, 0.1);
-        // After 20 s: some snow, but in patches, not a full-width layer.
-        for _ in 0..60 * 20 {
+        // Right after opening there is (almost) nothing.
+        for _ in 0..60 * 2 {
+            s.step(1.0 / 60.0);
+        }
+        let covered = s.piles[0].h.iter().filter(|&&h| h >= crate::pile::MIN_VISIBLE).count();
+        assert!(covered < s.piles[0].h.len() / 10, "no instant layer ({covered})");
+        // After 20 s: a thin, spread-out layer, far below the limit.
+        for _ in 0..60 * 18 {
             s.step(1.0 / 60.0);
         }
         let top = &s.piles[0];
+        let max = top.h.iter().cloned().fold(0.0, f32::max);
         let covered = top.h.iter().filter(|&&h| h >= crate::pile::MIN_VISIBLE).count();
-        assert!(covered > 0, "snow has started to settle");
-        assert!(covered < top.h.len() * 6 / 10, "but not as a full layer yet ({covered}/{})", top.h.len());
+        assert!(covered > top.h.len() / 4, "snow spreads along the edge ({covered}/{})", top.h.len());
+        assert!(max < 12.0 * 0.35, "but is still thin ({max})");
         // After several minutes the window is snowed in, within its limit.
         for _ in 0..60 * 400 {
             s.step(1.0 / 60.0);

@@ -127,7 +127,7 @@ impl Default for Weather {
 }
 
 /// Share of a landing flake's area that becomes pile depth. Lower = slower build-up.
-const DEPOSIT: f32 = 0.35;
+const DEPOSIT: f32 = 0.25;
 
 /// What a flake looks like, which also decides how it moves.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

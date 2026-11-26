@@ -17,7 +17,18 @@ const TASKBAR_ID: u64 = u64::MAX - 1000;
 struct Win {
     hwnd: HWND,
     rect: RECT,
-    maximized: bool,
+}
+
+/// What a scan found: surfaces snow can land on now, plus windows that still
+/// exist but are out of sight for the moment (minimized, maximized, on another
+/// virtual desktop). Snow on those is kept, not dropped, until they come back.
+pub struct Scan {
+    pub ledges: Vec<Ledge>,
+    pub parked: Vec<u64>,
+}
+
+fn id_of(hwnd: HWND) -> u64 {
+    hwnd.0 as usize as u64
 }
 
 unsafe fn frame_rect(hwnd: HWND) -> Option<RECT> {
@@ -41,13 +52,9 @@ unsafe fn class_name(hwnd: HWND) -> String {
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
-unsafe fn is_candidate(hwnd: HWND, own: &[HWND]) -> bool {
-    if own.contains(&hwnd) || !IsWindowVisible(hwnd).as_bool() || IsIconic(hwnd).as_bool() {
-        return false;
-    }
-    let mut cloaked = 0u32;
-    let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut _ as *mut _, 4);
-    if cloaked != 0 {
+/// Is this an ordinary application window (one that could carry snow)?
+unsafe fn is_app_window(hwnd: HWND, own: &[HWND]) -> bool {
+    if own.contains(&hwnd) || !IsWindowVisible(hwnd).as_bool() {
         return false;
     }
     let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
@@ -70,9 +77,10 @@ unsafe extern "system" fn collect(hwnd: HWND, lp: LPARAM) -> BOOL {
 /// Scan the desktop. `origin` is the overlay's top-left in screen coordinates.
 /// `window_max` is the deepest snow allowed on a window's top edge, in physical
 /// pixels; taskbars allow a little more.
-pub fn ledges(own: &[HWND], origin: (i32, i32), window_max: f32) -> Vec<Ledge> {
+pub fn scan(own: &[HWND], origin: (i32, i32), window_max: f32) -> Scan {
     let (ox, oy) = (origin.0 as f32, origin.1 as f32);
     let mut out = Vec::new();
+    let mut parked = Vec::new();
     unsafe {
         let mut all: Vec<HWND> = Vec::new();
         let _ = EnumWindows(Some(collect), LPARAM(&mut all as *mut _ as isize));
@@ -80,23 +88,32 @@ pub fn ledges(own: &[HWND], origin: (i32, i32), window_max: f32) -> Vec<Ledge> {
         // EnumWindows lists top-level windows front to back.
         let mut wins: Vec<Win> = Vec::new();
         for hwnd in all {
-            if !is_candidate(hwnd, own) {
+            if !is_app_window(hwnd, own) {
+                continue;
+            }
+            let mut cloaked = 0u32;
+            let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut _ as *mut _, 4);
+            // Minimized, on another virtual desktop, or maximized (its top is the top of
+            // the screen): out of sight for now, but its snow is kept for when it returns.
+            if IsIconic(hwnd).as_bool() || cloaked != 0 || IsZoomed(hwnd).as_bool() {
+                parked.push(id_of(hwnd));
                 continue;
             }
             let Some(rect) = frame_rect(hwnd) else { continue };
             if rect.right - rect.left < 120 || rect.bottom - rect.top < 60 {
                 continue;
             }
-            wins.push(Win { hwnd, rect, maximized: IsZoomed(hwnd).as_bool() });
-            if wins.len() >= 64 {
+            wins.push(Win { hwnd, rect });
+            if wins.len() >= 256 {
                 break;
             }
         }
 
         for (i, win) in wins.iter().enumerate() {
             let r = win.rect;
-            // Maximized windows touch the top of the screen: nowhere for snow to sit.
-            if win.maximized || r.top <= origin.1 + 2 {
+            // A top edge at the very top of the screen has nowhere for snow to sit.
+            if r.top <= origin.1 + 2 {
+                parked.push(id_of(win.hwnd));
                 continue;
             }
             let y = r.top as f32;
@@ -105,12 +122,11 @@ pub fn ledges(own: &[HWND], origin: (i32, i32), window_max: f32) -> Vec<Ledge> {
                 .filter(|o| (o.rect.top as f32) <= y + 1.0 && (o.rect.bottom as f32) > y - 2.0)
                 .map(|o| (o.rect.left as f32, o.rect.right as f32))
                 .collect();
+            // Fully covered windows are still reported (with nothing visible): their
+            // snow stays put behind the window in front and is there again later.
             let visible = visible_parts(r.left as f32, r.right as f32, covers);
-            if visible.is_empty() {
-                continue;
-            }
             out.push(Ledge {
-                id: win.hwnd.0 as usize as u64,
+                id: id_of(win.hwnd),
                 x0: r.left as f32 - ox,
                 x1: r.right as f32 - ox,
                 y: y - oy,
@@ -150,5 +166,5 @@ pub fn ledges(own: &[HWND], origin: (i32, i32), window_max: f32) -> Vec<Ledge> {
             }
         }
     }
-    out
+    Scan { ledges: out, parked }
 }

@@ -265,6 +265,8 @@ pub struct Snow {
     pub flakes: Vec<Flake>,
     pub piles: Vec<Pile>,
     pub puffs: Vec<Puff>,
+    /// Snow of windows that are out of sight for now (not drawn, not updated).
+    stash: Vec<Pile>,
     /// Seconds since start; drives twinkles and noise.
     pub time: f32,
     width: f32,
@@ -292,6 +294,7 @@ impl Snow {
             flakes: Vec::new(),
             piles: Vec::new(),
             puffs: Vec::new(),
+            stash: Vec::new(),
             time: 0.0,
             width,
             height,
@@ -338,6 +341,7 @@ impl Snow {
         self.height = height;
         // Window positions are about to be re-scanned in the new coordinates.
         self.piles.clear();
+        self.stash.clear();
         self.puffs.clear();
         if (scale - self.scale).abs() > f32::EPSILON {
             self.scale = scale;
@@ -348,38 +352,70 @@ impl Snow {
         }
     }
 
-    /// Replace the set of surfaces snow can land on. `interval` is the time
-    /// since the previous scan, used to fling snow off windows being dragged.
+    /// Replace the set of surfaces snow can land on (all other piles are gone).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn set_ledges(&mut self, ledges: &[Ledge], interval: f32) {
+        self.set_scene(ledges, &[], interval);
+    }
+
+    /// Update from a desktop scan. `ledges` are the surfaces present now; `parked`
+    /// are windows that still exist but are out of sight (minimized, maximized,
+    /// another desktop): their snow is put aside and comes back with them.
+    /// Only a window that is really gone (closed) or that moved or resized drops
+    /// its snow. `interval` is the time since the previous scan, used to fling
+    /// snow off windows being dragged.
+    pub fn set_scene(&mut self, ledges: &[Ledge], parked: &[u64], interval: f32) {
         let cell = 3.0 * self.scale;
         let iv = interval.max(0.016);
         let cap = 2500.0 * self.scale;
+        let same = |p: &Pile, l: &Ledge| {
+            (p.x0 - l.x0).abs() < 1.0 && (p.x1 - l.x1).abs() < 1.0 && (p.y - l.y).abs() < 1.0
+        };
         let mut old = std::mem::take(&mut self.piles);
         for l in ledges {
-            let found = old.iter().position(|p| p.id == l.id);
-            let pile = match found.map(|i| old.swap_remove(i)) {
-                Some(mut p) if (p.x0 - l.x0).abs() < 1.0 && (p.x1 - l.x1).abs() < 1.0 && (p.y - l.y).abs() < 1.0 => {
+            let pile = if let Some(i) = old.iter().position(|p| p.id == l.id) {
+                let mut p = old.swap_remove(i);
+                if same(&p, l) {
                     p.visible = l.visible.clone();
                     p.max_h = l.max_h;
                     p
-                }
-                Some(p) => {
+                } else {
                     // The window moved: its snow keeps the window's momentum.
                     let v = (((l.x0 - p.x0) / iv).clamp(-cap, cap), ((l.y - p.y) / iv).clamp(-cap, cap));
                     p.shake_off(&mut self.rng, self.scale, v, &mut self.puffs);
                     Pile::new(l, cell)
                 }
-                None => Pile::new(l, cell),
+            } else if let Some(i) = self.stash.iter().position(|p| p.id == l.id) {
+                // Back from being minimized / maximized: same place, same snow.
+                let mut p = self.stash.swap_remove(i);
+                if same(&p, l) {
+                    p.visible = l.visible.clone();
+                    p.max_h = l.max_h;
+                    p
+                } else {
+                    Pile::new(l, cell)
+                }
+            } else {
+                Pile::new(l, cell)
             };
             self.piles.push(pile);
         }
         for p in old {
-            p.shake_off(&mut self.rng, self.scale, (0.0, 0.0), &mut self.puffs);
+            if parked.contains(&p.id) {
+                self.stash.push(p);
+            } else {
+                // Closed: the snow falls off.
+                p.shake_off(&mut self.rng, self.scale, (0.0, 0.0), &mut self.puffs);
+            }
         }
+        // Forget stashed snow of windows that no longer exist at all.
+        self.stash.retain(|p| parked.contains(&p.id));
     }
 
     /// Knock all settled snow off at once (menu: clear snow). It falls as clumps.
     pub fn clear_piles(&mut self) {
+        // Snow put aside for minimized / maximized windows goes too.
+        self.stash.clear();
         for p in &mut self.piles {
             p.shake_off(&mut self.rng, self.scale, (0.0, 0.0), &mut self.puffs);
             p.h.iter_mut().for_each(|h| *h = 0.0);
@@ -965,6 +1001,45 @@ mod tests {
         let under: f32 = low.h[n / 10..n * 4 / 10].iter().sum::<f32>();
         let open: f32 = low.h[n * 6 / 10..n * 9 / 10].iter().sum::<f32>();
         assert!(under < open * 0.25, "sheltered {under} vs open {open}");
+    }
+
+    fn snowy(id: u64, x0: f32, y: f32) -> Ledge {
+        Ledge { id, x0, x1: x0 + 400.0, y, visible: vec![(x0, x0 + 400.0)], max_h: 12.0 }
+    }
+
+    #[test]
+    fn covered_minimized_or_maximized_windows_keep_their_snow_closed_ones_drop_it() {
+        let w = Weather { intensity: Intensity::Light, wind: Wind::Calm, ..Weather::default() };
+        let mut s = Snow::new(1600.0, 900.0, 1.0, w, 12);
+        let back = snowy(1, 200.0, 300.0);
+        s.set_scene(&[back.clone()], &[], 0.05);
+        for k in 0..2000 {
+            s.piles[0].deposit(200.0 + (k % 400) as f32, 20.0);
+            s.piles[0].relax();
+        }
+        let snow = s.piles[0].amount();
+
+        // A new window opens in front and covers the whole top edge.
+        let covered = Ledge { visible: vec![], ..back.clone() };
+        let front = snowy(2, 150.0, 250.0);
+        s.set_scene(&[front.clone(), covered.clone()], &[], 0.05);
+        assert!(s.puffs.is_empty(), "nothing falls when a window is covered");
+        assert!((s.piles.iter().find(|p| p.id == 1).unwrap().amount() - snow).abs() < 1.0);
+
+        // The front window closes: the back window's snow is still there.
+        s.set_scene(&[back.clone()], &[], 0.05);
+        assert!(s.puffs.is_empty());
+        assert!((s.piles[0].amount() - snow).abs() < 1.0);
+
+        // Minimized (or maximized): put aside, then restored where it was.
+        s.set_scene(&[], &[1], 0.05);
+        assert!(s.puffs.is_empty() && s.piles.is_empty(), "hidden while minimized, not dropped");
+        s.set_scene(&[back.clone()], &[], 0.05);
+        assert!((s.piles[0].amount() - snow).abs() < 1.0, "snow is back with the window");
+
+        // Closed for real: now it falls.
+        s.set_scene(&[], &[], 0.05);
+        assert!(!s.puffs.is_empty(), "closing the window drops its snow");
     }
 
     #[test]

@@ -256,11 +256,11 @@ fn frame() {
         if now - a.last_scan >= Duration::from_millis(50) {
             let interval = (now - a.last_scan).as_secs_f32().min(0.5);
             a.last_scan = now;
-            let ledges = match a.cfg.piles.window_px() {
-                Some(px) => scan::ledges(&[a.overlay, a.tray], a.origin, px * dpi_scale()),
-                None => Vec::new(),
+            let found = match a.cfg.piles.window_px() {
+                Some(px) => scan::scan(&[a.overlay, a.tray], a.origin, px * dpi_scale()),
+                None => scan::Scan { ledges: Vec::new(), parked: Vec::new() },
             };
-            a.snow.set_ledges(&ledges, interval);
+            a.snow.set_scene(&found.ledges, &found.parked, interval);
         }
         let mut pt = POINT::default();
         let cursor = unsafe { GetCursorPos(&mut pt) }

@@ -53,8 +53,9 @@ unsafe fn class_name(hwnd: HWND) -> String {
 }
 
 /// Is this an ordinary application window (one that could carry snow)?
+/// Hidden ones count too: an app "closed" to the tray only hides its window.
 unsafe fn is_app_window(hwnd: HWND, own: &[HWND]) -> bool {
-    if own.contains(&hwnd) || !IsWindowVisible(hwnd).as_bool() {
+    if own.contains(&hwnd) {
         return false;
     }
     let ex = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
@@ -91,10 +92,16 @@ pub fn scan(own: &[HWND], origin: (i32, i32), window_max: f32) -> Scan {
             if !is_app_window(hwnd, own) {
                 continue;
             }
+            if !IsWindowVisible(hwnd).as_bool() {
+                // Cheap check first: there are usually hundreds of hidden windows.
+                parked.push(id_of(hwnd));
+                continue;
+            }
             let mut cloaked = 0u32;
             let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut _ as *mut _, 4);
-            // Minimized, on another virtual desktop, or maximized (its top is the top of
-            // the screen): out of sight for now, but its snow is kept for when it returns.
+            // Hidden to the tray, minimized, on another virtual desktop, or maximized (its
+            // top is the top of the screen): out of sight for now, but its snow is kept
+            // for when it returns.
             if IsIconic(hwnd).as_bool() || cloaked != 0 || IsZoomed(hwnd).as_bool() {
                 parked.push(id_of(hwnd));
                 continue;

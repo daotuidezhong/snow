@@ -59,14 +59,15 @@ pub struct Puff {
 }
 
 /// Steepest slope a pile keeps, as rise over run (snow is not a wall).
-const SLOPE: f32 = 0.6;
+const SLOPE: f32 = 0.4;
 /// Slope of the rounded ends of a pile near the window corners.
-const END_SLOPE: f32 = 0.45;
-/// How fast snow evens out between neighbours each frame (0..0.5): dips fill in,
-/// so a layer spreads over its surroundings before it builds up.
-const SMOOTH: f32 = 0.12;
-/// How far a landing flake's snow is spread, in cells (Gaussian sigma).
-const SPREAD: f32 = 6.0;
+const END_SLOPE: f32 = 0.35;
+/// How fast snow evens out between neighbours each frame (0..0.5): keeps mounds
+/// round and soft without flattening them into a uniform strip.
+const SMOOTH: f32 = 0.04;
+/// How far a landing flake's snow is spread, in cells (Gaussian sigma): a small
+/// soft mound around where it landed.
+const SPREAD: f32 = 2.0;
 /// Thinner than this (px), snow is not drawn.
 pub const MIN_VISIBLE: f32 = 0.3;
 
@@ -119,6 +120,18 @@ impl Pile {
         }
     }
 
+    /// How much snow cell `i` catches relative to the average (about 0.1 .. 2).
+    fn dune(&self, i: usize) -> f32 {
+        let x = i as f32;
+        let w = self.wave;
+        // Ripple field in -1..1, sharpened so snow gathers into distinct mounds early
+        // on (like real fresh snow on a ledge); full piles still level out at the cap.
+        let r = (0.55 * (x * 0.31 + w).sin() + 0.3 * (x * 0.17 + 2.1 * w).sin() + 0.15 * (x * 0.73 + 4.3 * w).sin())
+            .clamp(-1.0, 1.0);
+        // Mean of this over x is about 1.
+        0.12 + 2.1 * ((r + 1.0) * 0.5).powf(2.2) * 1.55
+    }
+
     fn cap(&self, i: usize) -> f32 {
         self.cap_info(i).0
     }
@@ -148,7 +161,9 @@ impl Pile {
         let hi = (i as isize + r).min(n - 1);
         let w = |j: isize| (-((j - i as isize) as f32).powi(2) / (2.0 * SPREAD * SPREAD)).exp();
         let total: f32 = (lo..=hi).map(w).sum();
-        let dh = area / self.cell / total;
+        // Wind ripples: some spots catch more snow than others, so the layer grows
+        // as rolling dunes in stable places rather than as an even strip.
+        let dh = area / self.cell / total * self.dune(i);
         for j in lo..=hi {
             self.h[j as usize] += dh * w(j);
         }
@@ -158,18 +173,8 @@ impl Pile {
     /// pushed past the rounded ends is collected as spill to drop off the edge.
     pub fn relax(&mut self) {
         let n = self.h.len();
-        let lim = SLOPE * self.cell;
-        for i in 0..n.saturating_sub(1) {
-            let d = self.h[i] - self.h[i + 1];
-            if d.abs() > lim {
-                let m = (d.abs() - lim) * 0.5 * d.signum();
-                self.h[i] -= m;
-                self.h[i + 1] += m;
-            }
-        }
         if n >= 2 {
-            // Conservative smoothing between neighbours: higher cells shed into lower
-            // ones, so snow fills its surroundings and the layer rises evenly.
+            // Gentle smoothing between neighbours keeps mounds round and soft.
             self.scratch.clear();
             self.scratch.extend_from_slice(&self.h);
             for i in 0..n - 1 {
@@ -179,6 +184,7 @@ impl Pile {
                 self.h[i + 1] += flux;
             }
         }
+        // Depth limit; what is pushed past the rounded ends slides off as spill.
         for i in 0..n {
             let (c, at_end) = self.cap_info(i);
             if self.h[i] > c {
@@ -194,6 +200,26 @@ impl Pile {
             }
             if self.h[i] < 0.0 {
                 self.h[i] = 0.0;
+            }
+        }
+        // Avalanche last, both directions, so no step is left steeper than the
+        // angle of repose. It only moves snow downhill, never above a neighbour.
+        let lim = SLOPE * self.cell;
+        let fwd = 0..n.saturating_sub(1);
+        for _ in 0..6 {
+            let mut worst: f32 = 0.0;
+            for i in fwd.clone().chain(fwd.clone().rev()) {
+                let d = self.h[i] - self.h[i + 1];
+                if d.abs() > lim {
+                    // Settle slightly below the limit so the pass converges quickly.
+                    let m = (d.abs() - lim * 0.98) * 0.5 * d.signum();
+                    self.h[i] -= m;
+                    self.h[i + 1] += m;
+                    worst = worst.max(d.abs() - lim);
+                }
+            }
+            if worst < 0.01 {
+                break;
             }
         }
     }
@@ -351,30 +377,32 @@ mod tests {
     }
 
     #[test]
-    fn snow_spreads_over_its_surroundings_before_it_builds_up() {
-        let mut p = Pile::new(&ledge(0.0, 600.0), 3.0);
-        let mut first_wide = None;
-        // Flakes keep landing around one spot.
-        for k in 0..4000 {
-            p.deposit(300.0 + ((k * 37) % 21) as f32 - 10.0, 6.0);
+    fn falling_snow_builds_smooth_rolling_dunes() {
+        let mut p = Pile::new(&ledge(0.0, 900.0), 3.0);
+        let mut rng = Rng::new(3);
+        // Flakes land at random all along the edge, like real snowfall.
+        let mut seen_mounds = false;
+        for step in 0..6000 {
+            for _ in 0..2 {
+                p.deposit(rng.range(0.0, 900.0), 6.0);
+            }
             p.relax();
-            let max = p.h.iter().cloned().fold(0.0, f32::max);
-            let wide = p.h.iter().filter(|&&h| h >= MIN_VISIBLE).count();
-            if first_wide.is_none() && wide >= 25 {
-                first_wide = Some(max);
+            if step == 600 {
+                // Early on: separate soft mounds with bare gaps between some of them.
+                let peaks = (1..p.h.len() - 1).filter(|&i| p.h[i] > 0.5 && p.h[i] >= p.h[i - 1] && p.h[i] > p.h[i + 1]).count();
+                seen_mounds = peaks >= 5;
+            }
+            for w in p.h.windows(2) {
+                assert!((w[0] - w[1]).abs() < SLOPE * 3.0 + 0.1, "no steps or spikes: {w:?}");
             }
         }
-        // By the time it covers 25 cells (75 px) it is still a thin layer...
-        let max_when_wide = first_wide.expect("the layer spreads out");
-        assert!(max_when_wide < 2.5, "spreads first ({max_when_wide} px tall when 75 px wide)");
-        // ...and then it builds up into a smooth mound, no blocks or steps.
-        let max = p.h.iter().cloned().fold(0.0, f32::max);
-        assert!(max > 6.0, "then builds up ({max})");
-        let runs = p.runs();
-        assert_eq!(runs.len(), 1, "one continuous mound: {runs:?}");
-        for w in p.h.windows(2) {
-            assert!((w[0] - w[1]).abs() < 0.8, "no steps: {w:?}");
-        }
+        assert!(seen_mounds, "snow starts as individual mounds");
+        // Later: a continuous layer that still rolls (dunes), within the limit.
+        let inner = &p.h[30..p.h.len() - 30];
+        let (mn, mx) = inner.iter().fold((f32::MAX, 0.0f32), |(a, b), &h| (a.min(h), b.max(h)));
+        assert!(mn > 1.0, "continuous layer ({mn})");
+        assert!(mx - mn > 1.5, "with rolling dunes ({mn}..{mx})");
+        assert!(mx <= 12.0 + 1e-3);
     }
 
     #[test]
@@ -417,5 +445,16 @@ mod tests {
         let area: f32 = puffs.iter().map(|q| std::f32::consts::PI * q.r * q.r).sum();
         assert!(area > p.amount() * 0.7 && area <= p.amount() * 1.01, "{area} vs {}", p.amount());
         assert!(puffs.iter().map(|q| q.vx).sum::<f32>() > 0.0, "clumps fly the way the window moved");
+    }
+}
+
+#[cfg(test)]
+mod dune_norm {
+    use super::*;
+    #[test]
+    fn dune_field_averages_about_one() {
+        let p = Pile::new(&Ledge { id: 77, x0: 0.0, x1: 30000.0, y: 0.0, visible: vec![(0.0, 30000.0)], max_h: 10.0 }, 3.0);
+        let mean: f32 = (0..p.h.len()).map(|i| p.dune(i)).sum::<f32>() / p.h.len() as f32;
+        assert!((mean - 1.0).abs() < 0.15, "mean {mean}");
     }
 }

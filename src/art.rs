@@ -26,6 +26,7 @@ pub mod sprite {
     /// Irregular clumps of packed snow (thrown or falling off piles).
     pub const CLUMP: [u16; 8] = [16, 17, 18, 19, 20, 21, 22, 23];
     /// Lumps that sit on a pile's surface: like clumps, but no outline halo.
+    #[allow(dead_code)]
     pub const LUMP: [u16; 8] = [24, 25, 26, 27, 28, 29, 30, 31];
 }
 

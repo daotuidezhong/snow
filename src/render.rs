@@ -10,8 +10,8 @@ use windows::core::{Interface, Result};
 use windows::Foundation::Numerics::Matrix3x2;
 use windows::Win32::Foundation::{HMODULE, HWND};
 use windows::Win32::Graphics::Direct2D::Common::{
-    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED, D2D1_FIGURE_BEGIN_HOLLOW,
-    D2D1_FIGURE_END_CLOSED, D2D1_FIGURE_END_OPEN, D2D1_GRADIENT_STOP, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
+    D2D1_ALPHA_MODE_PREMULTIPLIED, D2D1_COLOR_F, D2D1_FIGURE_BEGIN_FILLED,
+    D2D1_FIGURE_END_CLOSED, D2D1_GRADIENT_STOP, D2D1_PIXEL_FORMAT, D2D_POINT_2F, D2D_RECT_F,
     D2D_RECT_U, D2D_SIZE_U,
 };
 use windows::Win32::Graphics::Direct2D::{
@@ -20,7 +20,7 @@ use windows::Win32::Graphics::Direct2D::{
     D2D1_ANTIALIAS_MODE_PER_PRIMITIVE, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, D2D1_BITMAP_OPTIONS_CANNOT_DRAW,
     D2D1_BITMAP_OPTIONS_NONE, D2D1_BITMAP_OPTIONS_TARGET, D2D1_BITMAP_PROPERTIES1, D2D1_DEVICE_CONTEXT_OPTIONS_NONE,
     D2D1_EXTEND_MODE_CLAMP, D2D1_FACTORY_OPTIONS, D2D1_FACTORY_TYPE_SINGLE_THREADED, D2D1_GAMMA_2_2,
-    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_SPRITE_OPTIONS_NONE,
+    D2D1_LINEAR_GRADIENT_BRUSH_PROPERTIES, D2D1_QUADRATIC_BEZIER_SEGMENT, D2D1_SPRITE_OPTIONS_NONE,
 };
 use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE, D3D_DRIVER_TYPE_HARDWARE, D3D_DRIVER_TYPE_WARP};
 use windows::Win32::Graphics::Direct3D11::{
@@ -50,8 +50,6 @@ pub struct Renderer {
     atlas: ID2D1Bitmap1,
     batch: ID2D1SpriteBatch,
     snow_fill: ID2D1LinearGradientBrush,
-    edge_brush: ID2D1SolidColorBrush,
-    crest_brush: ID2D1SolidColorBrush,
     shadow_brush: ID2D1SolidColorBrush,
     /// Physical pixels per logical pixel, for line widths and offsets.
     scale: f32,
@@ -157,8 +155,10 @@ impl Renderer {
                 // Mostly white so a fresh thin layer reads as snow, not a blue line;
                 // only the base of a deep drift picks up the cool shade.
                 D2D1_GRADIENT_STOP { position: 0.0, color: color(1.0, 1.0, 1.0, 1.0) },
-                D2D1_GRADIENT_STOP { position: 0.7, color: color(0.96, 0.975, 1.0, 1.0) },
-                D2D1_GRADIENT_STOP { position: 1.0, color: color(0.85, 0.89, 0.96, 1.0) },
+                D2D1_GRADIENT_STOP { position: 0.5, color: color(0.97, 0.98, 1.0, 1.0) },
+                D2D1_GRADIENT_STOP { position: 0.78, color: color(0.87, 0.9, 0.96, 1.0) },
+                D2D1_GRADIENT_STOP { position: 0.9, color: color(0.8, 0.85, 0.93, 0.85) },
+                D2D1_GRADIENT_STOP { position: 1.0, color: color(0.78, 0.83, 0.92, 0.0) },
             ];
             // The simple overload lives on ID2D1RenderTarget; the device context shadows it.
             let rt: ID2D1RenderTarget = dc.cast()?;
@@ -171,9 +171,7 @@ impl Renderer {
                 None,
                 &stops,
             )?;
-            let edge_brush = dc.CreateSolidColorBrush(&color(0.55, 0.62, 0.74, 0.7), None)?;
-            let crest_brush = dc.CreateSolidColorBrush(&color(1.0, 1.0, 1.0, 0.95), None)?;
-            let shadow_brush = dc.CreateSolidColorBrush(&color(0.08, 0.12, 0.2, 0.22), None)?;
+            let shadow_brush = dc.CreateSolidColorBrush(&color(0.05, 0.08, 0.14, 0.16), None)?;
 
             let r = Self {
                 swap,
@@ -182,8 +180,6 @@ impl Renderer {
                 atlas,
                 batch,
                 snow_fill,
-                edge_brush,
-                crest_brush,
                 shadow_brush,
                 scale,
                 rects: Vec::new(),
@@ -239,44 +235,38 @@ impl Renderer {
         self.xforms.push(Matrix3x2 { M11: squash * c, M12: squash * s, M21: -s, M22: c, M31: x, M32: y });
     }
 
-    /// Geometry for one pile's visible snow: the body of every patch, plus the
-    /// body and top line of the patches thick enough for an outline and shadow.
-    /// Thin, fresh snow gets neither, so it never reads as a line along the edge.
-    fn pile_geometry(&self, p: &Pile) -> Result<Option<[ID2D1PathGeometry1; 3]>> {
+    /// Geometry for one pile's visible snow: every patch (for the snow itself)
+    /// and the thicker patches (for their soft contact shadow). The top surface
+    /// is a chain of quadratic curves through the cell heights, so mounds are
+    /// round rather than faceted.
+    fn pile_geometry(&self, p: &Pile) -> Result<Option<[ID2D1PathGeometry1; 2]>> {
         let thick = 2.5 * self.scale;
         unsafe {
-            let geoms = [self.factory.CreatePathGeometry()?, self.factory.CreatePathGeometry()?, self.factory.CreatePathGeometry()?];
-            let sinks = [geoms[0].Open()?, geoms[1].Open()?, geoms[2].Open()?];
+            let geoms = [self.factory.CreatePathGeometry()?, self.factory.CreatePathGeometry()?];
+            let sinks = [geoms[0].Open()?, geoms[1].Open()?];
             let mut any = false;
-            let mut pts: Vec<D2D_POINT_2F> = Vec::new();
+            let mut curve: Vec<D2D1_QUADRATIC_BEZIER_SEGMENT> = Vec::new();
             for (i0, i1) in p.runs() {
-                let x_start = p.cell_x(i0) - p.cell * 0.5;
-                let x_end = p.cell_x(i1) + p.cell * 0.5;
-                pts.clear();
+                let x_start = p.cell_x(i0) - p.cell;
+                let x_end = p.cell_x(i1) + p.cell;
+                let pt = |i: usize| D2D_POINT_2F { x: p.cell_x(i), y: p.y - p.h[i] };
+                let mid = |a: D2D_POINT_2F, b: D2D_POINT_2F| D2D_POINT_2F { x: (a.x + b.x) * 0.5, y: (a.y + b.y) * 0.5 };
+                curve.clear();
+                // From the bare edge before the patch, through each cell as a control point.
                 for i in i0..=i1 {
-                    pts.push(D2D_POINT_2F { x: p.cell_x(i), y: p.y - p.h[i] });
+                    let c = pt(i);
+                    let next = if i < i1 { pt(i + 1) } else { D2D_POINT_2F { x: x_end, y: p.y } };
+                    let end = if i < i1 { mid(c, next) } else { next };
+                    curve.push(D2D1_QUADRATIC_BEZIER_SEGMENT { point1: c, point2: end });
                 }
-                pts.push(D2D_POINT_2F { x: x_end, y: p.y });
-                let start = D2D_POINT_2F { x: x_start, y: p.y };
                 let is_thick = p.h[i0..=i1].iter().any(|&h| h >= thick);
                 for (k, sink) in sinks.iter().enumerate() {
-                    if k > 0 && !is_thick {
+                    if k == 1 && !is_thick {
                         continue;
                     }
-                    if k < 2 {
-                        sink.BeginFigure(start, D2D1_FIGURE_BEGIN_FILLED);
-                        sink.AddLines(&pts);
-                        sink.EndFigure(D2D1_FIGURE_END_CLOSED);
-                    } else {
-                        // Only the part of the top line that is actually raised.
-                        let raised: Vec<D2D_POINT_2F> =
-                            pts.iter().copied().filter(|q| p.y - q.y >= thick * 0.6).collect();
-                        if raised.len() >= 2 {
-                            sink.BeginFigure(raised[0], D2D1_FIGURE_BEGIN_HOLLOW);
-                            sink.AddLines(&raised[1..]);
-                            sink.EndFigure(D2D1_FIGURE_END_OPEN);
-                        }
-                    }
+                    sink.BeginFigure(D2D_POINT_2F { x: x_start, y: p.y }, D2D1_FIGURE_BEGIN_FILLED);
+                    sink.AddQuadraticBeziers(&curve);
+                    sink.EndFigure(D2D1_FIGURE_END_CLOSED);
                 }
                 any = true;
             }
@@ -287,26 +277,23 @@ impl Renderer {
         }
     }
 
-    /// Shadow, outline, shaded body and bright crest for every pile.
+    /// Soft contact shadow, then the snow body: white on top, shading to a cool
+    /// grey-blue and fading out at the very bottom, so it blends into the edge
+    /// it sits on (no outline).
     fn draw_piles(&self, piles: &[Pile]) -> Result<()> {
         let s = self.scale;
         unsafe {
             self.dc.SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
             for p in piles {
-                let Some([fill, thick_fill, crest]) = self.pile_geometry(p)? else { continue };
-                // Soft contact shadow on the window just below and right of thick snow.
-                self.dc.SetTransform(&translate(0.8 * s, 1.6 * s));
+                let Some([fill, thick_fill]) = self.pile_geometry(p)? else { continue };
+                self.dc.SetTransform(&translate(0.0, 1.2 * s));
                 self.dc.FillGeometry(&thick_fill, &self.shadow_brush, None);
                 self.dc.SetTransform(&identity());
-                // Thin cool outline so white snow reads against white title bars.
-                self.dc.DrawGeometry(&crest, &self.edge_brush, 1.6 * s, None);
-                self.snow_fill.SetStartPoint(D2D_POINT_2F { x: 0.0, y: p.y - p.max_h });
-                self.snow_fill.SetEndPoint(D2D_POINT_2F { x: 0.0, y: p.y });
+                // A fixed-height gradient anchored at the base: thin snow is mostly the
+                // translucent bottom of it, deep drifts get the bright white top.
+                self.snow_fill.SetStartPoint(D2D_POINT_2F { x: 0.0, y: p.y - 12.0 * s });
+                self.snow_fill.SetEndPoint(D2D_POINT_2F { x: 0.0, y: p.y + 0.5 * s });
                 self.dc.FillGeometry(&fill, &self.snow_fill, None);
-                // Sunlit crest just inside the top surface.
-                self.dc.SetTransform(&translate(0.0, 0.9 * s));
-                self.dc.DrawGeometry(&crest, &self.crest_brush, 1.1 * s, None);
-                self.dc.SetTransform(&identity());
             }
         }
         Ok(())
@@ -330,24 +317,6 @@ impl Renderer {
         for f in snow.flakes.iter().filter(|f| f.depth >= FRONT_DEPTH) {
             self.push(f.sprite, f.x, f.y, f.r, f.angle, f.squash, f.alpha);
         }
-        // Lumpy surface texture: soft snow lumps half-sunk into each pile's crest.
-        for p in &snow.piles {
-            for i in 0..p.h.len() {
-                let hv = hash(p.id ^ 0x5EED, i as u64);
-                if hv % 5 != 0 || p.h[i] < 2.5 * s {
-                    continue;
-                }
-                let x = p.cell_x(i);
-                if !p.is_visible(x) {
-                    continue;
-                }
-                let grow = (p.h[i] / (0.5 * p.max_h)).min(1.0);
-                let r = (1.8 + 2.6 * ((hv >> 20) & 0xFF) as f32 / 255.0) * s * grow;
-                let id = sprite::LUMP[((hv >> 8) % 8) as usize];
-                let angle = ((hv >> 40) & 0xFFFF) as f32 / 65535.0 * 6.283;
-                self.push(id, x, p.y - p.h[i] + r * 0.55, r, angle, 1.0, 1.0);
-            }
-        }
         for p in &snow.puffs {
             self.push(p.sprite, p.x, p.y, p.r, p.angle, 1.0, p.alpha.min(1.0));
         }
@@ -355,7 +324,7 @@ impl Renderer {
         for p in &snow.piles {
             for i in 0..p.h.len() {
                 let hv = hash(p.id, i as u64);
-                if hv % 29 != 0 || p.h[i] < 2.5 * s {
+                if hv % 61 != 0 || p.h[i] < 2.5 * s {
                     continue;
                 }
                 let x = p.cell_x(i);

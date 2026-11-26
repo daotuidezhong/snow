@@ -127,7 +127,7 @@ impl Default for Weather {
 }
 
 /// Share of a landing flake's area that becomes pile depth. Lower = slower build-up.
-const DEPOSIT: f32 = 0.25;
+const DEPOSIT: f32 = 0.8;
 
 /// What a flake looks like, which also decides how it moves.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -942,18 +942,18 @@ mod tests {
             s.step(1.0 / 60.0);
         }
         let covered = s.piles[0].h.iter().filter(|&&h| h >= crate::pile::MIN_VISIBLE).count();
-        assert!(covered < s.piles[0].h.len() / 10, "no instant layer ({covered})");
-        // After 20 s: a thin, spread-out layer, far below the limit.
+        assert!(covered < s.piles[0].h.len() * 15 / 100, "no instant layer ({covered})");
+        // After 20 s: a visible layer along the edge that is still building up.
         for _ in 0..60 * 18 {
             s.step(1.0 / 60.0);
         }
         let top = &s.piles[0];
-        let max = top.h.iter().cloned().fold(0.0, f32::max);
+        let mean = top.h.iter().sum::<f32>() / top.h.len() as f32;
         let covered = top.h.iter().filter(|&&h| h >= crate::pile::MIN_VISIBLE).count();
-        assert!(covered > top.h.len() / 4, "snow spreads along the edge ({covered}/{})", top.h.len());
-        assert!(max < 12.0 * 0.35, "but is still thin ({max})");
-        // After several minutes the window is snowed in, within its limit.
-        for _ in 0..60 * 400 {
+        assert!(covered > top.h.len() / 2, "snow spreads along the edge ({covered}/{})", top.h.len());
+        assert!(mean > 1.0 && mean < 12.0 * 0.6, "visible and still growing ({mean})");
+        // A couple of minutes later the window is snowed in, within its limit.
+        for _ in 0..60 * 150 {
             s.step(1.0 / 60.0);
         }
         let top = &s.piles[0];
@@ -1054,6 +1054,31 @@ mod tests {
         }
         for v in FlakeSize::ALL {
             assert_eq!(FlakeSize::from_key(v.key()), Some(v));
+        }
+    }
+}
+
+#[cfg(test)]
+mod pace_probe {
+    use super::*;
+    #[test]
+    #[ignore]
+    fn print_pace() {
+        for (name, it) in [("light", Intensity::Light), ("normal", Intensity::Normal), ("heavy", Intensity::Heavy)] {
+            let w = Weather { intensity: it, wind: Wind::Calm, ..Weather::default() };
+            let mut s = Snow::new(1920.0, 1080.0, 1.0, w, 5);
+            s.set_ledges(&[Ledge { id: 1, x0: 400.0, x1: 1400.0, y: 300.0, visible: vec![(400.0, 1400.0)], max_h: 11.0 }], 0.1);
+            let mut out = String::new();
+            for sec in 1..=300 {
+                for _ in 0..60 { s.step(1.0 / 60.0); }
+                if [2, 5, 10, 20, 30, 60, 90, 120, 180, 300].contains(&sec) {
+                    let p = &s.piles[0];
+                    let cov = p.h.iter().filter(|&&h| h >= crate::pile::MIN_VISIBLE).count() * 100 / p.h.len();
+                    let mean = p.h.iter().sum::<f32>() / p.h.len() as f32;
+                    out += &format!(" {sec}s:{cov}%/{mean:.1}px");
+                }
+            }
+            eprintln!("PACE {name}{out}");
         }
     }
 }

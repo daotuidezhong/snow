@@ -67,8 +67,6 @@ const END_SLOPE: f32 = 0.45;
 const SMOOTH: f32 = 0.12;
 /// How far a landing flake's snow is spread, in cells (Gaussian sigma).
 const SPREAD: f32 = 6.0;
-/// Thinner than this (px) and isolated, snow is a film that slowly vanishes.
-const FILM: f32 = 0.2;
 /// Thinner than this (px), snow is not drawn.
 pub const MIN_VISIBLE: f32 = 0.3;
 
@@ -179,17 +177,6 @@ impl Pile {
                 let flux = SMOOTH * 0.5 * (a - b);
                 self.h[i] -= flux;
                 self.h[i + 1] += flux;
-            }
-        }
-        // The thin fringe of a patch, or a stray speck, fades away (sublimates)
-        // instead of creeping along the whole edge as an invisible film.
-        for i in 0..n {
-            if self.h[i] > 0.0 && self.h[i] < FILM {
-                let left = if i > 0 { self.h[i - 1] } else { 0.0 };
-                let right = if i + 1 < n { self.h[i + 1] } else { 0.0 };
-                if left < FILM * 2.0 && right < FILM * 2.0 {
-                    self.h[i] = (self.h[i] - 0.003).max(0.0);
-                }
             }
         }
         for i in 0..n {
@@ -391,13 +378,14 @@ mod tests {
     }
 
     #[test]
-    fn stray_film_fades() {
+    fn fallen_snow_never_disappears_by_itself() {
         let mut q = Pile::new(&ledge(0.0, 300.0), 3.0);
-        q.h[40] = 0.15;
-        for _ in 0..600 {
+        q.deposit(150.0, 3.0);
+        let before = q.amount();
+        for _ in 0..6000 {
             q.relax();
         }
-        assert!(q.h.iter().all(|&h| h < 0.01));
+        assert!((q.amount() - before).abs() < before * 0.01, "{} vs {before}", q.amount());
     }
 
     #[test]

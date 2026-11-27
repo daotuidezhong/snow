@@ -44,6 +44,9 @@ pub struct Config {
     pub weather: Weather,
     pub paused: bool,
     pub piles: PileDepth,
+    /// The mouse does not brush snow off piles. (Stored inverted so the default,
+    /// `false`, means sweeping is on.)
+    pub no_mouse_sweep: bool,
 }
 
 impl Config {
@@ -70,6 +73,7 @@ impl Config {
                     }
                 }
                 "paused" => c.paused = v == "true",
+                "mouse_sweep" => c.no_mouse_sweep = v == "false",
                 "piles" => {
                     if let Some(x) = PileDepth::from_key(v) {
                         c.piles = x
@@ -83,13 +87,14 @@ impl Config {
 
     pub fn serialize(&self) -> String {
         format!(
-            "# Snow settings\nintensity={}\nwind={}\nwind_dir={}\nsize={}\npaused={}\npiles={}\n",
+            "# Snow settings\nintensity={}\nwind={}\nwind_dir={}\nsize={}\npaused={}\npiles={}\nmouse_sweep={}\n",
             self.weather.intensity.key(),
             self.weather.wind.key(),
             if self.weather.wind_dir < 0.0 { "left" } else { "right" },
             self.weather.size.key(),
             self.paused,
             self.piles.key(),
+            !self.no_mouse_sweep,
         )
     }
 }
@@ -122,6 +127,7 @@ mod tests {
             weather: Weather { intensity: Intensity::Blizzard, wind: Wind::Strong, wind_dir: -1.0, size: FlakeSize::Large },
             paused: true,
             piles: PileDepth::Thick,
+            no_mouse_sweep: true,
         };
         assert_eq!(Config::parse(&c.serialize()), c);
     }

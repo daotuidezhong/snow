@@ -35,6 +35,7 @@ const ID_WIND_RIGHT: u32 = 126;
 const ID_SIZE: u32 = 130; // + index
 const ID_PILES: u32 = 135; // + index
 const ID_CLEAR: u32 = 139;
+const ID_SWEEP: u32 = 141;
 const ID_AUTOSTART: u32 = 140;
 const ID_ABOUT: u32 = 150;
 const ID_EXIT: u32 = 160;
@@ -266,7 +267,8 @@ fn frame() {
         let cursor = unsafe { GetCursorPos(&mut pt) }
             .ok()
             .map(|_| ((pt.x - a.origin.0) as f32, (pt.y - a.origin.1) as f32));
-        a.snow.set_cursor(cursor, dt);
+        // With mouse sweeping off, the snow never sees the cursor.
+        a.snow.set_cursor(if a.cfg.no_mouse_sweep { None } else { cursor }, dt);
         a.snow.step(dt);
 
         if a.renderer.is_none() && now - a.last_device_try > Duration::from_secs(2) {
@@ -443,6 +445,7 @@ fn show_menu(tray: HWND) {
             }
             append_sub(menu, sub, "积雪厚度");
         }
+        append(menu, ID_SWEEP, "鼠标扫雪", !cfg.no_mouse_sweep);
         append(menu, ID_CLEAR, "清除积雪", false);
         separator(menu);
         append(menu, ID_AUTOSTART, "开机自动启动", autostart::is_enabled());
@@ -482,6 +485,12 @@ fn run_command(id: u32) {
         ID_WIND_LEFT => set_weather(|w| w.wind_dir = -1.0),
         ID_WIND_RIGHT => set_weather(|w| w.wind_dir = 1.0),
         ID_AUTOSTART => autostart::set(!autostart::is_enabled()),
+        ID_SWEEP => {
+            with_app(|a| {
+                a.cfg.no_mouse_sweep = !a.cfg.no_mouse_sweep;
+                config::save(&a.cfg);
+            });
+        }
         ID_CLEAR => {
             with_app(|a| a.snow.clear_piles());
         }

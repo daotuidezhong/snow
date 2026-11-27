@@ -1043,6 +1043,24 @@ mod tests {
     }
 
     #[test]
+    fn a_minimized_window_comes_back_without_snow() {
+        let w = Weather { intensity: Intensity::Light, wind: Wind::Calm, ..Weather::default() };
+        let mut s = Snow::new(1600.0, 900.0, 1.0, w, 13);
+        let win = snowy(1, 200.0, 300.0);
+        s.set_scene(&[win.clone()], &[], 0.05);
+        for k in 0..2000 {
+            s.piles[0].deposit(200.0 + (k % 400) as f32, 20.0);
+            s.piles[0].relax();
+        }
+        // Minimized: the scan reports it neither as a surface nor as parked.
+        s.set_scene(&[], &[], 0.05);
+        assert!(!s.puffs.is_empty(), "its snow falls off");
+        // Restored at the same place: it starts again from nothing.
+        s.set_scene(&[win], &[], 0.05);
+        assert_eq!(s.piles[0].amount(), 0.0, "snow builds up again from scratch");
+    }
+
+    #[test]
     fn clearing_knocks_all_snow_off() {
         let w = Weather { wind: Wind::Calm, ..Weather::default() };
         let mut s = Snow::new(1000.0, 800.0, 1.0, w, 6);

@@ -57,6 +57,7 @@ pub struct Renderer {
     srcs: Vec<D2D_RECT_U>,
     colors: Vec<D2D1_COLOR_F>,
     xforms: Vec<Matrix3x2>,
+    visitor_sprites: Vec<crate::visitors::Sprite>,
     // Kept alive for as long as the window shows the swap chain.
     _d3d: ID3D11Device,
     _dcomp: IDCompositionDevice,
@@ -186,6 +187,7 @@ impl Renderer {
                 srcs: Vec::new(),
                 colors: Vec::new(),
                 xforms: Vec::new(),
+                visitor_sprites: Vec::new(),
                 _d3d: d3d,
                 _dcomp: dcomp,
                 _target: target,
@@ -224,12 +226,19 @@ impl Renderer {
     /// squashed across by `squash` (tumbling), with opacity `alpha`.
     fn push(&mut self, id: u16, x: f32, y: f32, r: f32, angle: f32, squash: f32, alpha: f32) {
         let half = r / art::body_fraction(id);
+        self.push_quad(id, x, y, half, angle, squash, alpha, [1.0, 1.0, 1.0]);
+    }
+
+    /// Queue one sprite by its quad half-size, multiplied by `tint` (a mirrored
+    /// sprite has a negative `squash`).
+    #[allow(clippy::too_many_arguments)]
+    fn push_quad(&mut self, id: u16, x: f32, y: f32, half: f32, angle: f32, squash: f32, alpha: f32, tint: [f32; 3]) {
         self.rects.push(D2D_RECT_F { left: -half, top: -half, right: half, bottom: half });
         let (x0, y0, x1, y1) = art::cell_rect(id);
         self.srcs.push(D2D_RECT_U { left: x0, top: y0, right: x1, bottom: y1 });
         // Sprite colours are straight alpha: D2D premultiplies them itself.
         // (Passing a premultiplied tint darkened faint flakes into grey rings.)
-        self.colors.push(color(1.0, 1.0, 1.0, alpha));
+        self.colors.push(color(tint[0], tint[1], tint[2], alpha));
         let (s, c) = angle.sin_cos();
         // Row-vector convention: squash along local x, then rotate, then move.
         self.xforms.push(Matrix3x2 { M11: squash * c, M12: squash * s, M21: -s, M22: c, M31: x, M32: y });
@@ -313,6 +322,12 @@ impl Renderer {
             self.push(f.sprite, f.x, f.y, f.r, f.angle, f.squash, f.alpha);
         }
         let back = self.rects.len() as u32;
+        // Penguins, the plow and its exhaust stand on the piles, in front of them.
+        self.visitor_sprites.clear();
+        snow.visitors.sprites(&snow.piles, s, &mut self.visitor_sprites);
+        for v in std::mem::take(&mut self.visitor_sprites) {
+            self.push_quad(v.id, v.x, v.y, v.half, v.angle, v.sx, v.alpha, v.tint);
+        }
         // Front layer: near flakes, flying clumps and powder.
         for f in snow.flakes.iter().filter(|f| f.depth >= FRONT_DEPTH) {
             self.push(f.sprite, f.x, f.y, f.r, f.angle, f.squash, f.alpha);

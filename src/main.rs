@@ -4,6 +4,7 @@ mod art;
 mod config;
 mod pile;
 mod snow;
+mod visitors;
 
 #[cfg(windows)]
 mod app;

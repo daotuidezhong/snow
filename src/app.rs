@@ -36,6 +36,10 @@ const ID_SIZE: u32 = 130; // + index
 const ID_PILES: u32 = 135; // + index
 const ID_CLEAR: u32 = 139;
 const ID_SWEEP: u32 = 141;
+const ID_PENGUINS: u32 = 170;
+const ID_PLOWS: u32 = 171;
+const ID_CALL_PENGUIN: u32 = 172;
+const ID_CALL_PLOW: u32 = 173;
 const ID_AUTOSTART: u32 = 140;
 const ID_ABOUT: u32 = 150;
 const ID_EXIT: u32 = 160;
@@ -176,7 +180,9 @@ pub fn run() {
         let cfg = config::load();
         autostart::refresh();
         let renderer = Renderer::new(overlay, w as u32, h as u32, dpi_scale()).ok();
-        let snow = Snow::new(w as f32, h as f32, dpi_scale(), cfg.weather, seed());
+        let mut snow = Snow::new(w as f32, h as f32, dpi_scale(), cfg.weather, seed());
+        snow.visitors.penguins_on = !cfg.no_penguins;
+        snow.visitors.plows_on = !cfg.no_plows;
         let taskbar_created = RegisterWindowMessageW(w!("TaskbarCreated"));
 
         APP.with(|a| {
@@ -445,6 +451,14 @@ fn show_menu(tray: HWND) {
             }
             append_sub(menu, sub, "积雪厚度");
         }
+        if let Ok(sub) = CreatePopupMenu() {
+            append(sub, ID_PENGUINS, "企鹅", !cfg.no_penguins);
+            append(sub, ID_PLOWS, "扫雪车", !cfg.no_plows);
+            separator(sub);
+            append(sub, ID_CALL_PENGUIN, "叫一只企鹅来", false);
+            append(sub, ID_CALL_PLOW, "叫扫雪车来", false);
+            append_sub(menu, sub, "访客");
+        }
         append(menu, ID_SWEEP, "鼠标扫雪", !cfg.no_mouse_sweep);
         append(menu, ID_CLEAR, "清除积雪", false);
         separator(menu);
@@ -485,6 +499,26 @@ fn run_command(id: u32) {
         ID_WIND_LEFT => set_weather(|w| w.wind_dir = -1.0),
         ID_WIND_RIGHT => set_weather(|w| w.wind_dir = 1.0),
         ID_AUTOSTART => autostart::set(!autostart::is_enabled()),
+        ID_PENGUINS => {
+            with_app(|a| {
+                a.cfg.no_penguins = !a.cfg.no_penguins;
+                a.snow.visitors.penguins_on = !a.cfg.no_penguins;
+                config::save(&a.cfg);
+            });
+        }
+        ID_PLOWS => {
+            with_app(|a| {
+                a.cfg.no_plows = !a.cfg.no_plows;
+                a.snow.visitors.plows_on = !a.cfg.no_plows;
+                config::save(&a.cfg);
+            });
+        }
+        ID_CALL_PENGUIN => {
+            with_app(|a| a.snow.visitors.summon_penguin());
+        }
+        ID_CALL_PLOW => {
+            with_app(|a| a.snow.visitors.summon_plow());
+        }
         ID_SWEEP => {
             with_app(|a| {
                 a.cfg.no_mouse_sweep = !a.cfg.no_mouse_sweep;

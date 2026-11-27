@@ -7,7 +7,7 @@ use crate::snow::Rng;
 /// Side of one atlas cell in pixels.
 pub const CELL: u32 = 128;
 pub const COLS: u32 = 8;
-pub const ROWS: u32 = 4;
+pub const ROWS: u32 = 5;
 pub const WIDTH: u32 = CELL * COLS;
 pub const HEIGHT: u32 = CELL * ROWS;
 
@@ -28,7 +28,18 @@ pub mod sprite {
     /// Lumps that sit on a pile's surface: like clumps, but no outline halo.
     #[allow(dead_code)]
     pub const LUMP: [u16; 8] = [24, 25, 26, 27, 28, 29, 30, 31];
+    /// Penguin facing right: standing, and the two halves of a waddle step.
+    pub const PENGUIN: [u16; 3] = [32, 33, 34];
+    /// The penguin's scarf, drawn white so each penguin can wear its own colour.
+    pub const SCARF: u16 = 35;
+    /// Snowplow body facing right (wheels drawn separately so they can turn).
+    pub const PLOW: u16 = 36;
+    pub const WHEEL: u16 = 37;
 }
+
+/// Cells that are intentionally left empty.
+#[cfg(test)]
+pub const UNUSED: [u16; 2] = [38, 39];
 
 /// For each sprite: the fraction of the cell's half-width that the visible
 /// "body" fills. Quads are sized so the body matches the flake radius.
@@ -42,6 +53,8 @@ pub fn body_fraction(id: u16) -> f32 {
         sprite::GLINT => 0.30,
         6 | 7 => 0.62,
         8..=15 => 0.88,
+        // Characters and vehicles: callers give the quad's half-size directly.
+        32..=39 => 1.0,
         _ => 0.62,
     }
 }
@@ -337,6 +350,140 @@ fn fluff(c: &mut Canvas, rng: &mut Rng) {
     }
 }
 
+/// Paint every pixel whose sub-samples fall inside `inside` (cell coordinates,
+/// 0..128, y down), 4x4 supersampled for smooth edges.
+fn fill(c: &mut Canvas, rgb: [f32; 3], inside: impl Fn(f32, f32) -> bool) {
+    for y in 0..CELL as usize {
+        for x in 0..CELL as usize {
+            let mut hit = 0;
+            for sy in 0..4 {
+                for sx in 0..4 {
+                    if inside(x as f32 + (sx as f32 + 0.5) / 4.0, y as f32 + (sy as f32 + 0.5) / 4.0) {
+                        hit += 1;
+                    }
+                }
+            }
+            if hit > 0 {
+                c.over(x, y, rgb, hit as f32 / 16.0);
+            }
+        }
+    }
+}
+
+fn ellipse(cx: f32, cy: f32, rx: f32, ry: f32, rot: f32) -> impl Fn(f32, f32) -> bool {
+    let (s, co) = rot.sin_cos();
+    move |x, y| {
+        let (dx, dy) = (x - cx, y - cy);
+        let (u, v) = (dx * co + dy * s, -dx * s + dy * co);
+        (u / rx).powi(2) + (v / ry).powi(2) <= 1.0
+    }
+}
+
+fn rrect(x0: f32, y0: f32, x1: f32, y1: f32, r: f32) -> impl Fn(f32, f32) -> bool {
+    move |x, y| {
+        let qx = (x0 + r - x).max(x - (x1 - r)).max(0.0);
+        let qy = (y0 + r - y).max(y - (y1 - r)).max(0.0);
+        x >= x0 && x <= x1 && y >= y0 && y <= y1 && qx * qx + qy * qy <= r * r
+    }
+}
+
+fn poly(pts: &'static [(f32, f32)]) -> impl Fn(f32, f32) -> bool {
+    move |x, y| {
+        let mut inside = false;
+        let n = pts.len();
+        for i in 0..n {
+            let (xi, yi) = pts[i];
+            let (xj, yj) = pts[(i + n - 1) % n];
+            if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+                inside = !inside;
+            }
+        }
+        inside
+    }
+}
+
+/// A round little penguin seen from the side, facing right. `step` 0 = standing,
+/// 1 and 2 = the two halves of a waddle (feet apart, flipper swinging).
+fn penguin(c: &mut Canvas, step: usize) {
+    let ink = [0.08, 0.1, 0.15];
+    let white = [0.97, 0.97, 0.96];
+    let orange = [0.98, 0.58, 0.12];
+    let (fa, fb, flip) = match step {
+        0 => ((52.0, 116.0), (72.0, 116.0), -0.25),
+        1 => ((42.0, 114.0), (80.0, 116.5), -0.55),
+        _ => ((60.0, 116.5), (66.0, 113.0), 0.05),
+    };
+    // Feet first, so the body sits on them.
+    fill(c, orange, ellipse(fa.0, fa.1, 12.0, 5.0, 0.0));
+    fill(c, orange, ellipse(fb.0, fb.1, 12.0, 5.0, 0.0));
+    // Body and head.
+    fill(c, ink, ellipse(62.0, 74.0, 31.0, 42.0, 0.0));
+    fill(c, ink, ellipse(66.0, 38.0, 24.0, 22.0, 0.0));
+    // White belly and face.
+    fill(c, white, ellipse(73.0, 80.0, 20.0, 32.0, 0.12));
+    fill(c, white, ellipse(76.0, 40.0, 13.0, 12.0, 0.0));
+    // Eye with a catch-light.
+    fill(c, ink, ellipse(80.0, 35.0, 3.6, 4.2, 0.0));
+    fill(c, white, ellipse(81.2, 33.6, 1.2, 1.2, 0.0));
+    // Beak.
+    fill(c, orange, poly(&[(86.0, 39.0), (104.0, 43.0), (86.0, 47.0)]));
+    // Flipper on the near side.
+    fill(c, [0.13, 0.15, 0.21], ellipse(54.0, 76.0, 9.0, 25.0, flip));
+}
+
+/// The scarf alone, in white (tinted per penguin when drawn).
+fn scarf(c: &mut Canvas) {
+    let w = [1.0, 1.0, 1.0];
+    fill(c, w, rrect(40.0, 52.0, 88.0, 61.0, 4.0));
+    // Tail fluttering behind.
+    fill(c, w, poly(&[(42.0, 56.0), (50.0, 58.0), (40.0, 80.0), (31.0, 76.0)]));
+    // A darker stripe so it reads as knitted.
+    fill(c, [0.78, 0.78, 0.78], rrect(40.0, 56.0, 88.0, 57.5, 0.0));
+}
+
+/// A small municipal snowplow facing right, without wheels.
+fn plow(c: &mut Canvas) {
+    let body = [0.83, 0.2, 0.16];
+    let dark = [0.17, 0.18, 0.21];
+    let steel = [0.74, 0.77, 0.82];
+    let glass = [0.62, 0.8, 0.94];
+    // Exhaust pipe behind the cab and the beacon's base on the roof.
+    fill(c, dark, rrect(25.0, 22.0, 31.0, 44.0, 2.0));
+    fill(c, dark, rrect(43.0, 33.0, 53.0, 40.0, 2.0));
+    // Chassis with wheel arches cut by the wheels drawn on top later.
+    fill(c, dark, rrect(16.0, 78.0, 100.0, 95.0, 4.0));
+    // Cab and hood.
+    fill(c, body, rrect(20.0, 39.0, 70.0, 84.0, 7.0));
+    fill(c, body, rrect(64.0, 57.0, 100.0, 86.0, 6.0));
+    // Window and a white stripe along the side.
+    fill(c, glass, rrect(29.0, 46.0, 62.0, 64.0, 4.0));
+    fill(c, [1.0, 0.98, 0.94], rrect(20.0, 70.0, 100.0, 74.0, 0.0));
+    // Headlight.
+    fill(c, [1.0, 0.94, 0.7], ellipse(97.0, 63.0, 3.0, 3.6, 0.0));
+    // Push arms and the curved blade.
+    fill(c, dark, rrect(96.0, 79.0, 108.0, 87.0, 2.0));
+    fill(c, steel, poly(&[(104.0, 58.0), (113.0, 56.0), (124.0, 70.0), (124.0, 106.0), (108.0, 106.0), (102.0, 92.0)]));
+    fill(c, [0.55, 0.58, 0.64], poly(&[(108.0, 100.0), (124.0, 100.0), (124.0, 106.0), (108.0, 106.0)]));
+}
+
+/// A tyre with a hub and lugs; the lugs show it turning.
+fn wheel(c: &mut Canvas) {
+    fill(c, [0.12, 0.12, 0.14], ellipse(64.0, 64.0, 58.0, 58.0, 0.0));
+    fill(c, [0.66, 0.68, 0.72], ellipse(64.0, 64.0, 28.0, 28.0, 0.0));
+    fill(c, [0.4, 0.42, 0.46], ellipse(64.0, 64.0, 10.0, 10.0, 0.0));
+    for k in 0..5 {
+        let a = k as f32 * std::f32::consts::TAU / 5.0;
+        let (x, y) = (64.0 + a.cos() * 19.0, 64.0 + a.sin() * 19.0);
+        fill(c, [0.3, 0.31, 0.35], ellipse(x, y, 4.0, 4.0, 0.0));
+    }
+    // Tread blocks around the rim.
+    for k in 0..12 {
+        let a = k as f32 * std::f32::consts::TAU / 12.0;
+        let (x, y) = (64.0 + a.cos() * 52.0, 64.0 + a.sin() * 52.0);
+        fill(c, [0.22, 0.22, 0.25], ellipse(x, y, 5.0, 5.0, a));
+    }
+}
+
 /// Build the whole atlas as premultiplied BGRA bytes (Direct2D's preferred layout).
 pub fn atlas_bgra() -> Vec<u8> {
     let mut rng = Rng::new(0x5_0_0_5_1_7);
@@ -365,6 +512,11 @@ pub fn atlas_bgra() -> Vec<u8> {
                 blobs(&mut c, &mut rng, body_fraction(id), count, 1.0);
                 c.add_shadow(3.0, 1.2);
             }
+            32..=34 => penguin(&mut c, (id - 32) as usize),
+            sprite::SCARF => scarf(&mut c),
+            sprite::PLOW => plow(&mut c),
+            sprite::WHEEL => wheel(&mut c),
+            38 | 39 => {}
             _ => {
                 let count = 3 + (rng.f() * 4.0) as usize;
                 blobs(&mut c, &mut rng, body_fraction(id), count, 0.7);
@@ -398,7 +550,7 @@ mod tests {
             // Premultiplied: no channel brighter than alpha.
             assert!(px[0] <= px[3] && px[1] <= px[3] && px[2] <= px[3]);
         }
-        for id in 0..(COLS * ROWS) as u16 {
+        for id in (0..(COLS * ROWS) as u16).filter(|id| !UNUSED.contains(id)) {
             let (x0, y0, x1, y1) = cell_rect(id);
             let mut cover = 0u32;
             for y in y0..y1 {

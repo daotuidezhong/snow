@@ -8,6 +8,7 @@
 
 use crate::art::sprite;
 use crate::pile::{clump_area, Ledge, Pile, Puff};
+use crate::visitors::Visitors;
 
 /// How much snow falls.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -267,6 +268,8 @@ pub struct Snow {
     pub puffs: Vec<Puff>,
     /// Snow of windows that are out of sight for now (not drawn, not updated).
     stash: Vec<Pile>,
+    /// Penguins and the snowplow.
+    pub visitors: Visitors,
     /// Seconds since start; drives twinkles and noise.
     pub time: f32,
     width: f32,
@@ -295,6 +298,7 @@ impl Snow {
             piles: Vec::new(),
             puffs: Vec::new(),
             stash: Vec::new(),
+            visitors: Visitors::new(),
             time: 0.0,
             width,
             height,
@@ -670,6 +674,7 @@ impl Snow {
         }
 
         self.step_piles(dt);
+        self.visitors.step(dt, &mut self.piles, &mut self.puffs, &mut self.rng, s, w, h);
         self.step_puffs(dt);
 
         // Recycle flakes that left the screen; keep the count at the target.

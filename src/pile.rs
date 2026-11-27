@@ -36,6 +36,12 @@ pub struct Pile {
     /// Snow that slid past the rounded ends and is about to drop off (area, px²).
     pub spill_left: f32,
     pub spill_right: f32,
+    /// Cells just ahead of a snowplow blade may hold a taller bank: (first, last).
+    pub boost: Option<(usize, usize)>,
+    /// Snow that overflowed the plow's bank this frame (area); thrown as spray.
+    pub boost_excess: f32,
+    /// Cell where a plow blade stands: a wall no snow slides or spreads across.
+    pub wall: Option<usize>,
     scratch: Vec<f32>,
 }
 
@@ -87,6 +93,9 @@ impl Pile {
             wave,
             spill_left: 0.0,
             spill_right: 0.0,
+            boost: None,
+            boost_excess: 0.0,
+            wall: None,
             scratch: Vec::new(),
         }
     }
@@ -113,11 +122,21 @@ impl Pile {
         // Full piles keep a soft wave instead of a flat slab.
         let top = self.max_h * (0.86 + 0.07 * ((x * 0.021 + self.wave).sin() + (x * 0.0073 + 2.0 * self.wave).sin()));
         let end = from_end * END_SLOPE + 0.5;
+        // The bank in front of a plow blade piles up much higher than settled snow.
+        let top = match self.boost {
+            Some((a, b)) if i >= a && i <= b => top * 1.7,
+            _ => top,
+        };
         if end < top {
             (end, true)
         } else {
             (top, false)
         }
+    }
+
+    /// Is the boundary between cells `i` and `i + 1` blocked by a plow blade?
+    fn blocked(&self, i: usize) -> bool {
+        self.wall.is_some_and(|w| w == i || w == i + 1)
     }
 
     /// How much snow cell `i` catches relative to the average (about 0.1 .. 2).
@@ -178,6 +197,9 @@ impl Pile {
             self.scratch.clear();
             self.scratch.extend_from_slice(&self.h);
             for i in 0..n - 1 {
+                if self.blocked(i) {
+                    continue;
+                }
                 let (a, b) = (self.scratch[i], self.scratch[i + 1]);
                 let flux = SMOOTH * 0.5 * (a - b);
                 self.h[i] -= flux;
@@ -188,13 +210,15 @@ impl Pile {
         for i in 0..n {
             let (c, at_end) = self.cap_info(i);
             if self.h[i] > c {
+                let area = (self.h[i] - c) * self.cell;
                 if at_end {
-                    let area = (self.h[i] - c) * self.cell;
                     if i < n / 2 {
                         self.spill_left += area;
                     } else {
                         self.spill_right += area;
                     }
+                } else if self.boost.is_some_and(|(a, b)| i >= a && i <= b) {
+                    self.boost_excess += area;
                 }
                 self.h[i] = c;
             }
@@ -209,6 +233,9 @@ impl Pile {
         for _ in 0..6 {
             let mut worst: f32 = 0.0;
             for i in fwd.clone().chain(fwd.clone().rev()) {
+                if self.blocked(i) {
+                    continue;
+                }
                 let d = self.h[i] - self.h[i + 1];
                 if d.abs() > lim {
                     // Settle slightly below the limit so the pass converges quickly.
@@ -224,8 +251,51 @@ impl Pile {
         }
     }
 
+    /// A plow blade swept from `from_x` to `to_x` this frame: everything it passed
+    /// over is pushed to the cell just ahead of it. Returns the snow pushed past
+    /// the end of the pile (area), which falls off the edge.
+    pub fn plow_push(&mut self, from_x: f32, to_x: f32) -> f32 {
+        let n = self.h.len() as isize;
+        let dir: isize = if to_x >= from_x { 1 } else { -1 };
+        let idx = |x: f32| ((x - self.x0) / self.cell).floor() as isize;
+        let (a, b) = (idx(from_x), idx(to_x));
+        let mut lost = 0.0;
+        let mut i = a;
+        loop {
+            if i >= 0 && i < n {
+                let amount = self.h[i as usize];
+                self.h[i as usize] = 0.0;
+                // The blade shoves snow into a wedge just ahead of it, not a column.
+                for (k, w) in [0.4, 0.3, 0.2, 0.1].into_iter().enumerate() {
+                    let j = i + dir * (k as isize + 1);
+                    if j >= 0 && j < n {
+                        self.h[j as usize] += amount * w;
+                    } else {
+                        lost += amount * w * self.cell;
+                    }
+                }
+            }
+            if i == b {
+                break;
+            }
+            i += dir;
+        }
+        lost
+    }
+
+    /// Something heavy stood here (a footstep, a sliding belly): pack the snow
+    /// down to `keep` of its depth over `radius` px around `x`.
+    pub fn press(&mut self, x: f32, radius: f32, keep: f32) {
+        for i in 0..self.h.len() {
+            let d = (self.cell_x(i) - x).abs();
+            if d <= radius {
+                let k = keep + (1.0 - keep) * (d / radius);
+                self.h[i] *= k;
+            }
+        }
+    }
+
     /// Total snow, in square pixels.
-    #[cfg_attr(not(test), allow(dead_code))]
     pub fn amount(&self) -> f32 {
         self.h.iter().sum::<f32>() * self.cell
     }
@@ -414,6 +484,47 @@ mod tests {
             q.relax();
         }
         assert!((q.amount() - before).abs() < before * 0.01, "{} vs {before}", q.amount());
+    }
+
+    #[test]
+    fn plow_blade_pushes_snow_ahead_and_off_the_end() {
+        let mut p = Pile::new(&ledge(0.0, 300.0), 3.0);
+        for i in 0..p.h.len() {
+            p.h[i] = 5.0;
+        }
+        let before = p.amount();
+        // Sweep the blade from x=0 to x=150 in small steps, as a plow would.
+        let mut x = 0.0;
+        let mut lost = 0.0;
+        while x < 150.0 {
+            lost += p.plow_push(x, x + 2.0);
+            x += 2.0;
+        }
+        let i_front = p.cell_at(150.0).unwrap();
+        // The cell under the blade's edge is cleared too; the bank sits just ahead.
+        assert!(p.h[..=i_front].iter().all(|&h| h == 0.0), "clear behind the blade");
+        // Everything that was behind the blade is now ahead of it, mostly close by.
+        let ahead: f32 = p.h[i_front + 1..].iter().sum();
+        let near: f32 = p.h[i_front + 1..i_front + 15].iter().sum();
+        assert!(ahead * p.cell + lost > before - 1.0);
+        assert!(near > (ahead - 50.0 * 5.0) * 0.6, "the bank sits right ahead of the blade ({near} of {ahead})");
+        assert!((p.amount() + lost - before).abs() < 1.0, "snow is moved, not destroyed");
+        // On to the end: everything goes over the edge.
+        while x < 300.0 {
+            lost += p.plow_push(x, x + 2.0);
+            x += 2.0;
+        }
+        assert!(p.amount() < 1.0 && (lost - before).abs() < 1.0);
+    }
+
+    #[test]
+    fn footsteps_leave_dents() {
+        let mut p = Pile::new(&ledge(0.0, 300.0), 3.0);
+        p.h.iter_mut().for_each(|h| *h = 6.0);
+        p.press(150.0, 4.0, 0.5);
+        let i = p.cell_at(150.0).unwrap();
+        assert!(p.h[i] < 4.5, "packed down ({})", p.h[i]);
+        assert_eq!(p.h[i + 3], 6.0, "only under the foot");
     }
 
     #[test]

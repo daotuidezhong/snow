@@ -1,6 +1,6 @@
 [package]
 name = "snow"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 description = "Snow falling on your Windows desktop"
 license = "MIT"

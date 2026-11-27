@@ -17,6 +17,8 @@ const TASKBAR_ID: u64 = u64::MAX - 1000;
 struct Win {
     hwnd: HWND,
     rect: RECT,
+    /// Maximized: hides what is behind it, but carries no snow of its own.
+    maximized: bool,
 }
 
 /// What a scan found: surfaces snow can land on now, plus windows that still
@@ -99,10 +101,14 @@ pub fn scan(own: &[HWND], origin: (i32, i32), window_max: f32) -> Scan {
             }
             let mut cloaked = 0u32;
             let _ = DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &mut cloaked as *mut _ as *mut _, 4);
-            // Hidden to the tray, minimized, on another virtual desktop, or maximized (its
-            // top is the top of the screen): out of sight for now, but its snow is kept
-            // for when it returns.
-            if IsIconic(hwnd).as_bool() || cloaked != 0 || IsZoomed(hwnd).as_bool() {
+            // Minimized: the window drops away, so its snow falls off (it is simply
+            // left out of the scan, like a closed window).
+            if IsIconic(hwnd).as_bool() {
+                continue;
+            }
+            // On another virtual desktop: out of sight for now, but its snow is kept
+            // for when you switch back.
+            if cloaked != 0 {
                 parked.push(id_of(hwnd));
                 continue;
             }
@@ -110,7 +116,9 @@ pub fn scan(own: &[HWND], origin: (i32, i32), window_max: f32) -> Scan {
             if rect.right - rect.left < 120 || rect.bottom - rect.top < 60 {
                 continue;
             }
-            wins.push(Win { hwnd, rect });
+            // Maximized windows keep their snow aside too, but they still cover
+            // everything behind them, so they stay in the list as occluders.
+            wins.push(Win { hwnd, rect, maximized: IsZoomed(hwnd).as_bool() });
             if wins.len() >= 256 {
                 break;
             }
@@ -118,15 +126,17 @@ pub fn scan(own: &[HWND], origin: (i32, i32), window_max: f32) -> Scan {
 
         for (i, win) in wins.iter().enumerate() {
             let r = win.rect;
-            // A top edge at the very top of the screen has nowhere for snow to sit.
-            if r.top <= origin.1 + 2 {
+            // Maximized, or a top edge at the very top of the screen: nowhere for snow to sit.
+            if win.maximized || r.top <= origin.1 + 2 {
                 parked.push(id_of(win.hwnd));
                 continue;
             }
             let y = r.top as f32;
+            // Anything in front that overlaps the band the snow occupies (from the edge
+            // up to the deepest the pile can get) hides that stretch of the pile.
             let covers = wins[..i]
                 .iter()
-                .filter(|o| (o.rect.top as f32) <= y + 1.0 && (o.rect.bottom as f32) > y - 2.0)
+                .filter(|o| (o.rect.top as f32) <= y + 1.0 && (o.rect.bottom as f32) > y - window_max - 2.0)
                 .map(|o| (o.rect.left as f32, o.rect.right as f32))
                 .collect();
             // Fully covered windows are still reported (with nothing visible): their
@@ -160,13 +170,21 @@ pub fn scan(own: &[HWND], origin: (i32, i32), window_max: f32) -> Scan {
                 if w <= h || h < 16 || r.top <= origin.1 + 2 {
                     continue;
                 }
+                // The taskbar sits above ordinary windows; only something that covers it
+                // entirely (a full-screen video or game) hides the snow on it.
+                let covers = wins
+                    .iter()
+                    .filter(|o| o.rect.top <= r.top - 2 && o.rect.bottom >= r.bottom)
+                    .map(|o| (o.rect.left as f32, o.rect.right as f32))
+                    .collect();
+                let visible = visible_parts(r.left as f32, r.right as f32, covers);
                 let (x0, x1) = (r.left as f32 - ox, r.right as f32 - ox);
                 out.push(Ledge {
                     id: TASKBAR_ID + k,
                     x0,
                     x1,
                     y: r.top as f32 - oy,
-                    visible: vec![(x0, x1)],
+                    visible: visible.into_iter().map(|(a, b)| (a - ox, b - ox)).collect(),
                     max_h: window_max * 1.4,
                 });
                 k += 1;
